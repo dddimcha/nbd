@@ -19,8 +19,8 @@ const (
 	// TierL1 adds a CRC32 per record: corruption is detected and degraded
 	// to base data, reported via *PartialRecoveryError.
 	TierL1 Tier = 1
-	// TierL2 wraps the L1 payload in Reed-Solomon shards. Not yet
-	// implemented; SerializeTier returns ErrUnsupportedTier.
+	// TierL2 wraps the L1 payload in Reed-Solomon shards: up to K lost or
+	// corrupt shards are reconstructed transparently. See rs.go.
 	TierL2 Tier = 2
 )
 
@@ -79,7 +79,7 @@ func (d *Device) SerializeTier(t Tier) ([]byte, error) {
 	case TierL1:
 		recSize = l1RecordSize
 	case TierL2:
-		return nil, ErrUnsupportedTier
+		return d.SerializeRS(0, 0) // defaults, see rs.go
 	default:
 		return nil, ErrUnsupportedTier
 	}
@@ -134,14 +134,23 @@ func Deserialize(blob, base []byte) (*Device, error) {
 	blockCount := binary.LittleEndian.Uint64(blob[6:14])
 	body := blob[headerSize:]
 
-	var recSize int
 	switch tier {
-	case TierL0:
-		recSize = l0RecordSize
-	case TierL1:
-		recSize = l1RecordSize
+	case TierL0, TierL1:
+		return applyRecords(body, tier, blockCount, base)
+	case TierL2:
+		return deserializeRS(body, blockCount, base)
 	default:
 		return nil, ErrUnsupportedTier
+	}
+}
+
+// applyRecords decodes a section of L0/L1 records onto a fresh device over
+// base. It is shared by the L0/L1 paths and by the L2 layer, which feeds it
+// the Reed-Solomon-recovered record payload.
+func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Device, error) {
+	recSize := l0RecordSize
+	if tier == TierL1 {
+		recSize = l1RecordSize
 	}
 
 	dev := New(base)

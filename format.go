@@ -243,8 +243,11 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 	// blocks. Trade-off: the arena stays live as long as ANY of its blocks
 	// is referenced from the overlay, so memory is pinned in proportion to
 	// the decoded delta even if most blocks are later overwritten (an
-	// overwrite reuses the same window). That is acceptable here because
-	// the overlay itself already holds all n blocks live.
+	// overwrite reuses the same window). On partial recovery, records that
+	// were skipped (bad CRC, out-of-range index) still consume their arena
+	// windows, so a single surviving record can pin up to n*BlockSize —
+	// bounded by ~1x the blob size the caller already accepted, which we
+	// deem acceptable.
 	arena := make([]byte, n*BlockSize)
 
 	for i := 0; i < n; i++ {

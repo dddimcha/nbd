@@ -24,8 +24,7 @@ dev2, _ := blockdevice.Deserialize(blob, base)
 |------|------------|------------------------------|
 | L0 (default) | none — smallest possible | 8 B (0.2%) |
 | L1 | corruption detection, partial recovery | 12 B (0.3%) |
-| L2 Hamming | + single-bit-flip correction per 64-bit word | 524 B (12.8%) |
-| L2 Reed–Solomon | + reconstruction of up to K lost shards | K/N of the blob |
+| L2 | Reed–Solomon: reconstructs up to K lost/corrupt shards | K/N of the blob |
 
 Every record carries its own block index, so a decoder survives reordering,
 gaps and truncation; a corrupt block degrades to the base content instead of

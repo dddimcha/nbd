@@ -23,7 +23,8 @@ serialization deterministic (byte-identical for identical state).
 header:  magic "BDEV" (4) | version (1) | tier (1) | blockCount (8) | headerCRC32 (4)
 L0 rec:  index (8) | data (4096)
 L1 rec:  index (8) | data (4096) | crc32(index|data) (4)
-L2H rec: index (8) | data (4096) | ecc (512) | crc32 (4)
+L2:      L1 payload split into N data shards + K parity shards
+         shard header: shardIndex (2) | shardSize (4) | crc32 (4)
 ```
 
 Records are self-describing: the index lives inside the record, so ordering,
@@ -40,23 +41,24 @@ default and integrity is opt-in via the header tier byte.
   into *erasures*: bad records are skipped, good ones applied, and the caller
   gets `*PartialRecoveryError{BadBlocks}`. Reads of a bad block fall back to
   base data — graceful degradation instead of total failure.
-- **L2 Hamming** — word-wise SECDED Hamming(72,64): 8 parity bits per 64-bit
-  word, 512 B per block. Corrects one bit flip per word (up to 512 scattered
-  flips per block), detects double flips. CRC stays on top as the arbiter
-  against miscorrection. Zero dependencies. Protects against bit rot, not
-  against lost records.
-- **L2 Reed–Solomon** — the delta is split into N data shards + K parity
-  (klauspost/reedsolomon). Per-shard CRC marks bad shards as erasures;
-  `Reconstruct` recovers up to K fully lost shards. This is the MinIO/RAID
-  model in miniature: it survives truncation and torn ranges, which Hamming
-  cannot. The only external dependency, isolated in its own package.
+- **L2 Reed–Solomon** — the L1 payload is split into N data shards + K parity
+  shards (klauspost/reedsolomon). Per-shard CRC marks bad shards as erasures;
+  `Reconstruct` recovers up to K fully lost or corrupt shards, then the result
+  decodes as ordinary L1. This is the MinIO/RAID model in miniature: it
+  survives bit rot, truncation and torn ranges alike. The only external
+  dependency, isolated in its own file behind the tier switch.
+
+Word-wise Hamming SECDED was considered as a zero-dependency middle tier and
+rejected: at 12.5% overhead it only repairs scattered bit flips, while the
+realistic failure classes for a serialized delta (truncation, lost ranges) need
+erasure coding anyway. RS at 10+2 costs 20% but recovers the loss of 20% of
+the blob outright.
 
 ## Why not one tier
 
-Bit flips and lost ranges are different failure classes: Hamming repairs the
-former cheaply in-place, erasure coding repairs the latter but costs K/N.
-Stacking both by default would contradict the smallest-overhead requirement,
-so the format makes integrity a per-blob choice recorded in the header.
+Integrity always costs overhead and the spec demands the smallest possible
+format, so protection is a per-blob choice recorded in the header, not a
+default tax.
 
 ## Testing strategy
 

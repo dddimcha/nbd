@@ -1,6 +1,6 @@
 ---
 name: go-engineer
-description: Implements the Go packages (blockdevice core, hamming ECC, RS integrity layer). Use for all production code changes.
+description: Implements the Go packages (blockdevice core, RS integrity layer). Use for all production code changes.
 tools: Read, Grep, Glob, Write, Edit, Bash
 ---
 

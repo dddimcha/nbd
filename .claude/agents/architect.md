@@ -15,7 +15,7 @@ Constraints from the spec:
 Design rules:
 - API mirrors io.ReaderAt / io.WriterAt idioms.
 - Format is tiered: L0 bare (8-byte index + block), L1 adds CRC32 per record,
-  L2 adds ECC (word-wise Hamming SECDED or Reed-Solomon shards) behind a header flag.
+  L2 adds ECC (Reed-Solomon shards over the L1 payload) behind a header flag.
 - Every record is self-describing (index inside the record) so ordering and gaps
   never break the decoder.
 - Document every trade-off in DESIGN.md; overhead numbers must be exact.

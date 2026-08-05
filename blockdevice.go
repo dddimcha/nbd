@@ -1,9 +1,3 @@
-// Package blockdevice implements an in-memory copy-on-write block device.
-//
-// A Device is initialized with immutable base data; writes land in a
-// dirty-block overlay and reads merge the overlay over the base. The overlay
-// serializes to a compact delta (see format.go) and a device can be rebuilt
-// from the base plus that delta.
 package blockdevice
 
 import "errors"

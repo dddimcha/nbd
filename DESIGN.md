@@ -23,9 +23,14 @@ serialization deterministic (byte-identical for identical state).
 header:  magic "BDEV" (4) | version (1) | tier (1) | blockCount (8) | headerCRC32 (4)
 L0 rec:  index (8) | data (4096)
 L1 rec:  index (8) | data (4096) | crc32(index|data) (4)
-L2:      L1 payload split into N data shards + K parity shards
-         shard header: shardIndex (2) | shardSize (4) | crc32 (4)
+L2:      rsMeta: dataShards N (2) | parityShards K (2) | shardSize (4) |
+                 payloadLen (8) | crc32 (4)
+         then (N+K) shards, each: shardIndex (2) | crc32(shard data) (4) |
+                                  shardSize bytes
 ```
+
+The 6-byte shard header carries no size field: shardSize is global, stored
+once in rsMeta.
 
 Records are self-describing: the index lives inside the record, so ordering,
 gaps and truncation never confuse the decoder — a truncated blob still parses
@@ -47,6 +52,13 @@ default and integrity is opt-in via the header tier byte.
   decodes as ordinary L1. This is the MinIO/RAID model in miniature: it
   survives bit rot, truncation and torn ranges alike. The only external
   dependency, isolated in its own file behind the tier switch.
+
+  Default geometry scales with the delta: N = min(10, max(1, payloadLen/4096))
+  data shards, K = 2 parity shards. Ten or more dirty blocks get the full
+  10+2 (20% parity overhead); small deltas keep N low so they are not sliced
+  into slivers — but the parity cost is then proportionally large: a single
+  dirty block is 1+2 shards, i.e. ~200% overhead (plus the 6-byte shard
+  headers and 20-byte rsMeta). L2 only pays off for deltas of several blocks.
 
 Word-wise Hamming SECDED was considered as a zero-dependency middle tier and
 rejected: at 12.5% overhead it only repairs scattered bit flips, while the

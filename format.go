@@ -45,13 +45,42 @@ var (
 // returned device is usable, but the listed blocks could not be recovered and
 // read as base data.
 type PartialRecoveryError struct {
-	// BadBlocks lists the unrecoverable block indices, sorted ascending.
+	// BadBlocks lists the unrecoverable block indices, sorted ascending and
+	// deduplicated. A block that was ultimately recovered (e.g. a duplicate
+	// record with an intact copy) is never listed.
 	BadBlocks []int64
+	// Truncated reports that data was lost without a nameable block index:
+	// a cut-off tail whose index bytes are unreadable, surplus bytes beyond
+	// the header's blockCount, an unverifiable header, or shard regions lost
+	// beyond repair. Every non-nil PartialRecoveryError has at least one
+	// BadBlocks entry or Truncated set (or both).
+	Truncated bool
 }
 
 // Error implements the error interface.
 func (e *PartialRecoveryError) Error() string {
-	return fmt.Sprintf("blockdevice: partial recovery, %d bad block(s): %v", len(e.BadBlocks), e.BadBlocks)
+	return fmt.Sprintf("blockdevice: partial recovery, %d bad block(s): %v (truncated: %v)",
+		len(e.BadBlocks), e.BadBlocks, e.Truncated)
+}
+
+// finalizeBad post-processes a bad-block list: entries whose block was in the
+// end successfully applied are dropped, duplicates are removed, and the
+// result is sorted ascending.
+func finalizeBad(dev *Device, bad []int64) []int64 {
+	seen := make(map[int64]bool, len(bad))
+	out := bad[:0]
+	for _, b := range bad {
+		if seen[b] {
+			continue
+		}
+		seen[b] = true
+		if _, applied := dev.dirty[b]; applied {
+			continue
+		}
+		out = append(out, b)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
+	return out
 }
 
 // sortedIndices returns the dirty block indices in ascending order.
@@ -112,9 +141,12 @@ func (d *Device) SerializeTier(t Tier) ([]byte, error) {
 // are applied only if their CRC verifies. Records that fail CRC, fall out of
 // base bounds, or are cut off by a truncated tail are skipped and reported
 // via *PartialRecoveryError alongside the (still usable) device; the affected
-// blocks read as base data. If the header CRC fails on an L1-record-sized
-// blob, Deserialize falls back to scanning fixed-stride L1 records and
-// applies those that self-verify. Untrusted input never panics.
+// blocks read as base data. Exactly blockCount (from the header) records are
+// applied; surplus records or bytes appended beyond that are treated as
+// corruption and reported via *PartialRecoveryError with Truncated set. If
+// the header CRC fails on an L1-record-sized blob whose tier byte still reads
+// TierL1 (or is out of range), Deserialize falls back to scanning fixed-stride
+// L1 records and applies those that self-verify. Untrusted input never panics.
 func Deserialize(blob, base []byte) (*Device, error) {
 	if len(base)%BlockSize != 0 {
 		return nil, ErrCorrupt
@@ -127,7 +159,18 @@ func Deserialize(blob, base []byte) (*Device, error) {
 	}
 	wantCRC := binary.LittleEndian.Uint32(blob[14:18])
 	if crc32.ChecksumIEEE(blob[:14]) != wantCRC {
-		return deserializeHeaderless(blob, base)
+		// The header failed its CRC, so its fields are untrustworthy. Only
+		// attempt the fixed-stride L1 fallback scan when the tier byte still
+		// reads TierL1, or is itself out of the known range (i.e. plausibly
+		// the corrupted field): scanning an L0 or L2 body at L1 stride could
+		// only "recover" records via CRC32 collisions. CRC32 accepts a random
+		// candidate with probability 2^-32, so an m-record scan expects
+		// m/2^32 false accepts — negligible for realistic blob sizes, but
+		// not cryptographic protection.
+		if t := Tier(blob[5]); t == TierL1 || t > TierL2 {
+			return deserializeHeaderless(blob, base)
+		}
+		return nil, ErrCorrupt
 	}
 
 	tier := Tier(blob[5])
@@ -156,16 +199,32 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 	dev := New(base)
 	maxBlock := int64(len(base) / BlockSize)
 	var bad []int64
-	truncated := false
+	partial := false      // anything was skipped, lost, or surplus
+	unattributed := false // loss with no nameable block index
 
+	// The header CRC covers layout, not content, so blockCount is an upper
+	// bound the body must honor: exactly blockCount records are applied and
+	// any surplus bytes are treated as corruption (reported via
+	// *PartialRecoveryError with Truncated set — the device built from the
+	// first blockCount records is still returned).
 	n := len(body) / recSize
-	if len(body)%recSize != 0 || uint64(n) < blockCount {
-		truncated = true
-		// If the partial tail carries a readable index, report it.
+	if uint64(n) >= blockCount {
+		if uint64(n) > blockCount || len(body)%recSize != 0 {
+			partial, unattributed = true, true
+			n = int(blockCount)
+		}
+	} else {
+		partial = true
+		// If the partial tail carries a readable index, report it;
+		// otherwise the loss is unattributable.
 		if tail := body[n*recSize:]; len(tail) >= 8 {
 			if idx := int64(binary.LittleEndian.Uint64(tail[0:8])); idx >= 0 && idx < maxBlock {
 				bad = append(bad, idx)
+			} else {
+				unattributed = true
 			}
+		} else {
+			unattributed = true
 		}
 	}
 
@@ -175,15 +234,17 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 		if tier == TierL1 {
 			want := binary.LittleEndian.Uint32(rec[8+BlockSize:])
 			if crc32.ChecksumIEEE(rec[:8+BlockSize]) != want {
+				partial = true // any skipped record makes recovery partial
 				if idx >= 0 && idx < maxBlock {
 					bad = append(bad, idx)
+				} else {
+					unattributed = true
 				}
-				truncated = true // any skipped record makes recovery partial
 				continue
 			}
 		}
 		if idx < 0 || idx >= maxBlock {
-			truncated = true
+			partial, unattributed = true, true
 			continue
 		}
 		b := make([]byte, BlockSize)
@@ -191,9 +252,14 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 		dev.dirty[idx] = b
 	}
 
-	if truncated || len(bad) > 0 {
-		sort.Slice(bad, func(a, b int) bool { return bad[a] < bad[b] })
-		return dev, &PartialRecoveryError{BadBlocks: bad}
+	bad = finalizeBad(dev, bad)
+	if partial || len(bad) > 0 {
+		// Invariant: a non-nil PartialRecoveryError carries at least one
+		// BadBlocks entry or Truncated (see the type doc).
+		if len(bad) == 0 {
+			unattributed = true
+		}
+		return dev, &PartialRecoveryError{BadBlocks: bad, Truncated: unattributed}
 	}
 	return dev, nil
 }
@@ -229,6 +295,7 @@ func deserializeHeaderless(blob, base []byte) (*Device, error) {
 	if recovered == 0 {
 		return nil, ErrCorrupt
 	}
-	sort.Slice(bad, func(a, b int) bool { return bad[a] < bad[b] })
-	return dev, &PartialRecoveryError{BadBlocks: bad}
+	// The header itself is unverifiable, so completeness is unknowable:
+	// Truncated is always set on this path.
+	return dev, &PartialRecoveryError{BadBlocks: finalizeBad(dev, bad), Truncated: true}
 }

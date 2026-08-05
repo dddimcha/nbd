@@ -19,9 +19,11 @@ package blockdevice
 // shardSize), and K parity shards are computed with klauspost/reedsolomon.
 // On decode, every shard whose CRC fails — or that is missing/truncated — is
 // treated as an erasure; up to K erasures are fully reconstructed. Beyond K,
-// decoding degrades: intact data shards are laid into a zero-filled payload
-// and whichever L1 records still self-verify are applied, with the rest
-// reported via *PartialRecoveryError.
+// decoding degrades: records lying fully inside intact data shards are
+// applied if they self-verify, records overlapping lost shards are skipped
+// and reported via *PartialRecoveryError (by index when readable, else via
+// the Truncated flag). Lost regions are never zero-filled into the record
+// stream.
 
 import (
 	"encoding/binary"
@@ -176,6 +178,19 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 	if dataShards < 1 || parityShards < 0 || total > rsMaxShards {
 		return nil, ErrCorrupt
 	}
+	// A CRC-valid rsMeta is not a trustworthy rsMeta (CRC32 is not
+	// authentication), so its fields must also be internally consistent and
+	// consistent with the bytes actually present:
+	//   - the payload is whole L1 records and matches the header blockCount;
+	//   - shardSize is exactly what SerializeRS derives from payloadLen;
+	//   - the claimed shard geometry cannot exceed a small multiple of
+	//     len(body) — allocations stay O(len(blob)), never a forged multi-GB
+	//     demand from a tiny blob. The 4x slack tolerates truncation of up
+	//     to ~75% of the blob; rsMaxDecodeAlloc stays as an absolute cap.
+	if payloadLen64%uint64(l1RecordSize) != 0 ||
+		payloadLen64/uint64(l1RecordSize) != blockCount {
+		return nil, ErrCorrupt
+	}
 	if uint64(total)*uint64(shardSize) > rsMaxDecodeAlloc ||
 		payloadLen64 > uint64(dataShards)*uint64(shardSize) {
 		return nil, ErrCorrupt
@@ -186,6 +201,12 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 		return applyRecords(nil, TierL1, blockCount, base)
 	}
 	if shardSize == 0 {
+		return nil, ErrCorrupt
+	}
+	if shardSize != (payloadLen+dataShards-1)/dataShards {
+		return nil, ErrCorrupt
+	}
+	if uint64(total)*uint64(rsShardHdrSize+shardSize) > 4*uint64(len(body)) {
 		return nil, ErrCorrupt
 	}
 
@@ -227,29 +248,75 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 		// fall through to per-record salvage.
 	}
 
-	// More than K erasures (or reconstruction failure): salvage. Lay the
-	// intact data shards into a zero-filled payload and apply whichever L1
-	// records still self-verify; applyRecords reports the rest as partial.
-	payload := make([]byte, payloadLen)
-	for i := 0; i < dataShards; i++ {
-		if shards[i] == nil {
-			continue
+	// More than K erasures (or reconstruction failure): salvage record by
+	// record. Regions covered by lost data shards are SKIPPED, never
+	// zero-filled — feeding zeroed spans into the record decoder would parse
+	// pseudo-records with index 0 and misreport which blocks were lost.
+	// A record fully inside intact shards decodes normally; a record that
+	// overlaps a lost shard is reported by its true index when the 8-byte
+	// index field is still readable, else counted as unattributable loss
+	// (Truncated).
+	return rsSalvage(shards, dataShards, shardSize, payloadLen, base)
+}
+
+// rsSalvage applies whatever L1 records survive when Reed-Solomon
+// reconstruction is impossible. shards[i] == nil marks a lost shard.
+func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []byte) (*Device, error) {
+	// readSpan copies payload bytes [off, off+len(dst)) out of the intact
+	// data shards; it reports false if any covering shard is lost.
+	readSpan := func(dst []byte, off int) bool {
+		for len(dst) > 0 {
+			si := off / shardSize
+			if si >= dataShards || shards[si] == nil {
+				return false
+			}
+			n := copy(dst, shards[si][off%shardSize:])
+			dst = dst[n:]
+			off += n
 		}
-		lo := i * shardSize
-		if lo >= payloadLen {
-			continue
-		}
-		hi := lo + shardSize
-		if hi > payloadLen {
-			hi = payloadLen
-		}
-		copy(payload[lo:hi], shards[i][:hi-lo])
+		return true
 	}
-	dev, err := applyRecords(payload, TierL1, blockCount, base)
-	if err == nil && missing > 0 {
-		// Data survived only because every lost shard was parity — still a
-		// full recovery. Otherwise applyRecords already reported partial.
+
+	dev := New(base)
+	maxBlock := int64(len(base) / BlockSize)
+	var bad []int64
+	unattributed := false
+	rec := make([]byte, l1RecordSize)
+	for lo := 0; lo+l1RecordSize <= payloadLen; lo += l1RecordSize {
+		if readSpan(rec, lo) {
+			idx := int64(binary.LittleEndian.Uint64(rec[0:8]))
+			want := binary.LittleEndian.Uint32(rec[8+BlockSize : l1RecordSize])
+			if crc32.ChecksumIEEE(rec[:8+BlockSize]) == want && idx >= 0 && idx < maxBlock {
+				b := make([]byte, BlockSize)
+				copy(b, rec[8:8+BlockSize])
+				dev.dirty[idx] = b
+			} else if idx >= 0 && idx < maxBlock {
+				bad = append(bad, idx)
+			} else {
+				unattributed = true
+			}
+			continue
+		}
+		// Record overlaps a lost shard: name the block if the index field
+		// happens to lie in an intact shard.
+		var idxBuf [8]byte
+		if readSpan(idxBuf[:], lo) {
+			if idx := int64(binary.LittleEndian.Uint64(idxBuf[:])); idx >= 0 && idx < maxBlock {
+				bad = append(bad, idx)
+				continue
+			}
+		}
+		unattributed = true
+	}
+
+	bad = finalizeBad(dev, bad)
+	if len(bad) == 0 && !unattributed {
+		// Every record decoded — the lost shards were all parity (or
+		// padding). Full recovery.
 		return dev, nil
 	}
-	return dev, err
+	if len(bad) == 0 {
+		unattributed = true
+	}
+	return dev, &PartialRecoveryError{BadBlocks: bad, Truncated: unattributed}
 }

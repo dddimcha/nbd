@@ -46,7 +46,11 @@ func (d *Device) checkRange(n int, off int64) error {
 	if off%BlockSize != 0 || n%BlockSize != 0 {
 		return ErrUnaligned
 	}
-	if off < 0 || off+int64(n) > int64(len(d.base)) {
+	// Overflow-safe bounds check: never compute off+n directly — for a huge
+	// off the sum wraps negative and would pass a naive comparison. n is a
+	// slice length, so 0 <= n <= MaxInt; comparing n against the remaining
+	// space (len(base)-off, non-negative once off is validated) cannot wrap.
+	if off < 0 || off > int64(len(d.base)) || int64(n) > int64(len(d.base))-off {
 		return ErrOutOfRange
 	}
 	return nil
@@ -61,6 +65,8 @@ func (d *Device) ReadAt(p []byte, off int64) (int, error) {
 	}
 	n := 0
 	for n < len(p) {
+		// checkRange guarantees off+len(p) <= len(base), so idx*BlockSize
+		// stays within int64 and within the base slice.
 		idx := (off + int64(n)) / BlockSize
 		src := d.base[idx*BlockSize : (idx+1)*BlockSize]
 		if b, ok := d.dirty[idx]; ok {

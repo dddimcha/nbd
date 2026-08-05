@@ -67,6 +67,9 @@ func (e *PartialRecoveryError) Error() string {
 // end successfully applied are dropped, duplicates are removed, and the
 // result is sorted ascending.
 func finalizeBad(dev *Device, bad []int64) []int64 {
+	if len(bad) == 0 {
+		return nil // happy path: no map/sort churn
+	}
 	seen := make(map[int64]bool, len(bad))
 	out := bad[:0]
 	for _, b := range bad {
@@ -228,6 +231,22 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 		}
 	}
 
+	// Pre-size the overlay for the records actually present. n is derived
+	// from len(body), not the untrusted blockCount header field, so a
+	// hostile header cannot force a huge allocation.
+	dev.dirty = make(map[int64][]byte, n)
+
+	// One arena allocation sliced per record instead of n per-block makes.
+	// Each block owns a capacity-capped BlockSize window (three-index
+	// slices), so buffers stay independent and never alias blob or base;
+	// WriteAt copies into the existing buffer and cannot bleed across
+	// blocks. Trade-off: the arena stays live as long as ANY of its blocks
+	// is referenced from the overlay, so memory is pinned in proportion to
+	// the decoded delta even if most blocks are later overwritten (an
+	// overwrite reuses the same window). That is acceptable here because
+	// the overlay itself already holds all n blocks live.
+	arena := make([]byte, n*BlockSize)
+
 	for i := 0; i < n; i++ {
 		rec := body[i*recSize : (i+1)*recSize]
 		idx := int64(binary.LittleEndian.Uint64(rec[0:8]))
@@ -247,7 +266,7 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 			partial, unattributed = true, true
 			continue
 		}
-		b := make([]byte, BlockSize)
+		b := arena[i*BlockSize : (i+1)*BlockSize : (i+1)*BlockSize]
 		copy(b, rec[8:8+BlockSize])
 		dev.dirty[idx] = b
 	}
@@ -277,6 +296,12 @@ func deserializeHeaderless(blob, base []byte) (*Device, error) {
 	maxBlock := int64(len(base) / BlockSize)
 	var bad []int64
 	recovered := 0
+	// Same pre-sizing and single-arena strategy as applyRecords; see the
+	// aliasing/pinning notes there. Sizing follows len(body), so hostile
+	// input cannot inflate it.
+	nRecs := len(body) / l1RecordSize
+	dev.dirty = make(map[int64][]byte, nRecs)
+	arena := make([]byte, nRecs*BlockSize)
 	for i := 0; i+l1RecordSize <= len(body); i += l1RecordSize {
 		rec := body[i : i+l1RecordSize]
 		idx := int64(binary.LittleEndian.Uint64(rec[0:8]))
@@ -287,7 +312,8 @@ func deserializeHeaderless(blob, base []byte) (*Device, error) {
 			}
 			continue
 		}
-		b := make([]byte, BlockSize)
+		r := i / l1RecordSize
+		b := arena[r*BlockSize : (r+1)*BlockSize : (r+1)*BlockSize]
 		copy(b, rec[8:8+BlockSize])
 		dev.dirty[idx] = b
 		recovered++

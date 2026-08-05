@@ -15,3 +15,6 @@ Rules:
   (ErrCorrupt, *PartialRecoveryError) and degrades corrupt blocks to base data.
 - gofmt-clean, go vet-clean; exported identifiers documented.
 - Keep allocations minimal; benchmarks must not regress.
+
+Work test-first: follow .claude/skills/test-driven-development/SKILL.md.
+For multi-task work, follow .claude/skills/subagent-driven-development/SKILL.md.

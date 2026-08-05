@@ -15,3 +15,6 @@ Coverage bar:
 - Fuzz (testing.F): mutated blobs never panic; result is a valid device or a typed error.
 - Benchmarks (testing.B) for ReadAt, WriteAt, Serialize, Deserialize.
 - Always run: gofmt -l ., go vet ./..., go test -race ./...
+
+Follow .claude/skills/test-driven-development/SKILL.md; before declaring done,
+apply .claude/skills/verification-before-completion/SKILL.md.

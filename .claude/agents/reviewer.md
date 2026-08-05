@@ -15,3 +15,6 @@ Checklist:
 - Overhead claims in DESIGN.md match the actual encoded sizes.
 - go vet, -race tests and fuzz smoke pass.
 Report findings as file:line with a concrete failure scenario; no style nitpicks.
+
+Run reviews per .claude/skills/requesting-code-review/SKILL.md; the author must
+have applied .claude/skills/verification-before-completion/SKILL.md first.

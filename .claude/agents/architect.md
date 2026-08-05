@@ -19,3 +19,7 @@ Design rules:
 - Every record is self-describing (index inside the record) so ordering and gaps
   never break the decoder.
 - Document every trade-off in DESIGN.md; overhead numbers must be exact.
+
+Before designing, read .claude/skills/writing-plans/SKILL.md and follow its
+plan structure; hand parallelizable work to the team per
+.claude/skills/dispatching-parallel-agents/SKILL.md.

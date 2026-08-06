@@ -20,6 +20,8 @@ jobs:
       - name: Test
         run: go test -race ./...
       - name: Fuzz smoke
-        run: go test -run='^$' -fuzz=FuzzDeserialize -fuzztime=30s ./blockdevice
+        run: go test -run='^$' -fuzz='^FuzzDeserialize$' -fuzztime=30s ./blockdevice
+      - name: Fuzz smoke (resealed header)
+        run: go test -run='^$' -fuzz='^FuzzDeserializeResealed$' -fuzztime=30s ./blockdevice
       - name: Bench smoke
         run: go test -run='^$' -bench=. -benchtime=1x ./blockdevice

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"runtime"
 	"sort"
+	"sync"
 )
 
 // Tier selects the serialization integrity level.
@@ -125,17 +127,57 @@ func (d *Device) SerializeTier(t Tier) ([]byte, error) {
 	binary.LittleEndian.PutUint64(blob[6:14], uint64(len(idxs)))
 	binary.LittleEndian.PutUint32(blob[14:18], crc32.ChecksumIEEE(blob[:14]))
 
-	off := headerSize
+	d.writeRecords(blob[headerSize:], idxs, recSize, t == TierL1)
+	return blob, nil
+}
+
+// writeRecordRange serializes the records for idxs into dst at recSize stride,
+// appending a per-record CRC32 when withCRC is set. dst must be exactly
+// len(idxs)*recSize bytes.
+func (d *Device) writeRecordRange(dst []byte, idxs []int64, recSize int, withCRC bool) {
+	off := 0
 	for _, idx := range idxs {
-		binary.LittleEndian.PutUint64(blob[off:off+8], uint64(idx))
-		copy(blob[off+8:off+8+BlockSize], d.dirty[idx])
-		if t == TierL1 {
-			crc := crc32.ChecksumIEEE(blob[off : off+8+BlockSize])
-			binary.LittleEndian.PutUint32(blob[off+8+BlockSize:off+recSize], crc)
+		binary.LittleEndian.PutUint64(dst[off:off+8], uint64(idx))
+		copy(dst[off+8:off+8+BlockSize], d.dirty[idx])
+		if withCRC {
+			crc := crc32.ChecksumIEEE(dst[off : off+8+BlockSize])
+			binary.LittleEndian.PutUint32(dst[off+8+BlockSize:off+recSize], crc)
 		}
 		off += recSize
 	}
-	return blob, nil
+}
+
+// writeRecords is writeRecordRange fanned out over goroutines for large
+// deltas. Each worker owns a disjoint, position-determined slice of dst, so
+// the output bytes are identical to the sequential path regardless of
+// scheduling. Worker count is GOMAXPROCS capped so every worker serializes at
+// least serialMinPerWorker records — below that the spawn/join overhead
+// outweighs the win and the sequential path runs instead.
+const serialMinPerWorker = 128
+
+func (d *Device) writeRecords(dst []byte, idxs []int64, recSize int, withCRC bool) {
+	workers := runtime.GOMAXPROCS(0)
+	if max := len(idxs) / serialMinPerWorker; workers > max {
+		workers = max
+	}
+	if workers <= 1 {
+		d.writeRecordRange(dst, idxs, recSize, withCRC)
+		return
+	}
+	chunk := (len(idxs) + workers - 1) / workers
+	var wg sync.WaitGroup
+	for lo := 0; lo < len(idxs); lo += chunk {
+		hi := lo + chunk
+		if hi > len(idxs) {
+			hi = len(idxs)
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			d.writeRecordRange(dst[lo*recSize:hi*recSize], idxs[lo:hi], recSize, withCRC)
+		}(lo, hi)
+	}
+	wg.Wait()
 }
 
 // Deserialize rebuilds a Device from base plus a serialized delta.

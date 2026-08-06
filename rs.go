@@ -28,6 +28,8 @@ package blockdevice
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"runtime"
+	"sync"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -64,20 +66,10 @@ func rsDefaultShards(payloadLen int) (data, parity int) {
 // rsDefaultShards). SerializeTier(TierL2) is equivalent to SerializeRS(0, 0).
 func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 	idxs := d.sortedIndices()
-
-	// Build the L1 record payload.
-	payload := make([]byte, len(idxs)*l1RecordSize)
-	off := 0
-	for _, idx := range idxs {
-		binary.LittleEndian.PutUint64(payload[off:off+8], uint64(idx))
-		copy(payload[off+8:off+8+BlockSize], d.dirty[idx])
-		crc := crc32.ChecksumIEEE(payload[off : off+8+BlockSize])
-		binary.LittleEndian.PutUint32(payload[off+8+BlockSize:off+l1RecordSize], crc)
-		off += l1RecordSize
-	}
+	payloadLen := len(idxs) * l1RecordSize
 
 	if dataShards <= 0 || parityShards <= 0 {
-		dd, dp := rsDefaultShards(len(payload))
+		dd, dp := rsDefaultShards(payloadLen)
 		if dataShards <= 0 {
 			dataShards = dd
 		}
@@ -90,8 +82,8 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 	}
 
 	shardSize := 0
-	if len(payload) > 0 {
-		shardSize = (len(payload) + dataShards - 1) / dataShards
+	if payloadLen > 0 {
+		shardSize = (payloadLen + dataShards - 1) / dataShards
 	}
 	total := dataShards + parityShards
 
@@ -106,7 +98,7 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 	binary.LittleEndian.PutUint16(meta[0:2], uint16(dataShards))
 	binary.LittleEndian.PutUint16(meta[2:4], uint16(parityShards))
 	binary.LittleEndian.PutUint32(meta[4:8], uint32(shardSize))
-	binary.LittleEndian.PutUint64(meta[8:16], uint64(len(payload)))
+	binary.LittleEndian.PutUint64(meta[8:16], uint64(payloadLen))
 	binary.LittleEndian.PutUint32(meta[16:20], crc32.ChecksumIEEE(meta[:16]))
 
 	if shardSize == 0 {
@@ -124,16 +116,12 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 		s := blob[base+i*(rsShardHdrSize+shardSize):]
 		shards[i] = s[rsShardHdrSize : rsShardHdrSize+shardSize]
 	}
-	for i := 0; i < dataShards; i++ {
-		lo := i * shardSize
-		if lo < len(payload) {
-			hi := lo + shardSize
-			if hi > len(payload) {
-				hi = len(payload)
-			}
-			copy(shards[i], payload[lo:hi])
-		}
-	}
+	// The L1 record payload is written straight into the data-shard slots —
+	// no intermediate payload buffer, no second copy. Records straddling a
+	// shard boundary are split by writeShardSpans; the record CRC is computed
+	// incrementally from the contiguous sources, so the bytes are identical
+	// to building a flat payload and slicing it into shards.
+	writeRecordsSharded(d, idxs, shards[:dataShards], shardSize)
 	enc, err := reedsolomon.New(dataShards, parityShards)
 	if err != nil {
 		return nil, ErrUnsupportedTier
@@ -141,12 +129,78 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 	if err := enc.Encode(shards); err != nil {
 		return nil, ErrCorrupt
 	}
+	// Shard headers: index + CRC per shard. Each iteration touches only its
+	// own header and shard, so fanning out per shard keeps the output
+	// byte-identical to the sequential order.
+	var wg sync.WaitGroup
 	for i := 0; i < total; i++ {
-		hdr := blob[base+i*(rsShardHdrSize+shardSize):]
-		binary.LittleEndian.PutUint16(hdr[0:2], uint16(i))
-		binary.LittleEndian.PutUint32(hdr[2:6], crc32.ChecksumIEEE(shards[i]))
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			hdr := blob[base+i*(rsShardHdrSize+shardSize):]
+			binary.LittleEndian.PutUint16(hdr[0:2], uint16(i))
+			binary.LittleEndian.PutUint32(hdr[2:6], crc32.ChecksumIEEE(shards[i]))
+		}(i)
 	}
+	wg.Wait()
 	return blob, nil
+}
+
+// writeShardSpans copies src into the data shards at payload offset off,
+// splitting across shard boundaries, and returns the offset past the write.
+func writeShardSpans(shards [][]byte, shardSize, off int, src []byte) int {
+	for len(src) > 0 {
+		n := copy(shards[off/shardSize][off%shardSize:], src)
+		src = src[n:]
+		off += n
+	}
+	return off
+}
+
+// writeRecordRangeSharded serializes idxs as L1 records directly into the
+// data shards, starting at payload offset off. Byte-for-byte identical to
+// writing a flat L1 payload and splitting it into shards.
+func writeRecordRangeSharded(d *Device, idxs []int64, shards [][]byte, shardSize, off int) {
+	var hdr [8]byte
+	var tail [4]byte
+	for _, idx := range idxs {
+		binary.LittleEndian.PutUint64(hdr[:], uint64(idx))
+		block := d.dirty[idx]
+		crc := crc32.Update(crc32.ChecksumIEEE(hdr[:]), crc32.IEEETable, block)
+		binary.LittleEndian.PutUint32(tail[:], crc)
+		off = writeShardSpans(shards, shardSize, off, hdr[:])
+		off = writeShardSpans(shards, shardSize, off, block)
+		off = writeShardSpans(shards, shardSize, off, tail[:])
+	}
+}
+
+// writeRecordsSharded is writeRecordRangeSharded fanned out over goroutines
+// for large deltas, mirroring writeRecords in format.go: each worker owns the
+// payload byte range determined solely by its record positions, so output is
+// deterministic regardless of scheduling.
+func writeRecordsSharded(d *Device, idxs []int64, shards [][]byte, shardSize int) {
+	workers := runtime.GOMAXPROCS(0)
+	if max := len(idxs) / serialMinPerWorker; workers > max {
+		workers = max
+	}
+	if workers <= 1 {
+		writeRecordRangeSharded(d, idxs, shards, shardSize, 0)
+		return
+	}
+	chunk := (len(idxs) + workers - 1) / workers
+	var wg sync.WaitGroup
+	for lo := 0; lo < len(idxs); lo += chunk {
+		hi := lo + chunk
+		if hi > len(idxs) {
+			hi = len(idxs)
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			writeRecordRangeSharded(d, idxs[lo:hi], shards, shardSize, lo*l1RecordSize)
+		}(lo, hi)
+	}
+	wg.Wait()
 }
 
 // writeEmptyShardHeaders writes shard headers for shardSize == 0.

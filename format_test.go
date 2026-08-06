@@ -365,3 +365,62 @@ func TestDeserializeRejects(t *testing.T) {
 		})
 	}
 }
+
+// TestSerializeParallelByteIdentity covers the goroutine-fanned record
+// writers (writeRecords / writeRecordsSharded), which only engage above
+// serialMinPerWorker records per worker: a large delta serialized via the
+// public API must be byte-identical to the single-threaded reference built
+// with writeRecordRange, and the L2 blob must equal the flat-payload-split
+// construction.
+func TestSerializeParallelByteIdentity(t *testing.T) {
+	const baseBlocks = 8192
+	dirty := make([]int64, 0, baseBlocks/2)
+	for i := int64(0); i < baseBlocks; i += 2 {
+		dirty = append(dirty, i)
+	}
+	dev, _ := fmtDevice(t, baseBlocks, dirty)
+	idxs := dev.sortedIndices()
+
+	for _, tier := range []Tier{TierL0, TierL1} {
+		recSize := l0RecordSize
+		if tier == TierL1 {
+			recSize = l1RecordSize
+		}
+		blob, err := dev.SerializeTier(tier)
+		if err != nil {
+			t.Fatalf("SerializeTier(%d): %v", tier, err)
+		}
+		want := make([]byte, len(idxs)*recSize)
+		dev.writeRecordRange(want, idxs, recSize, tier == TierL1)
+		if !bytes.Equal(blob[headerSize:], want) {
+			t.Errorf("tier %d: parallel record section differs from sequential reference", tier)
+		}
+	}
+
+	// L2: rebuild the reference blob from a flat sequential payload.
+	blob, err := dev.SerializeTier(TierL2)
+	if err != nil {
+		t.Fatalf("SerializeTier(L2): %v", err)
+	}
+	payload := make([]byte, len(idxs)*l1RecordSize)
+	dev.writeRecordRange(payload, idxs, l1RecordSize, true)
+	dataShards, _ := rsDefaultShards(len(payload))
+	shardSize := (len(payload) + dataShards - 1) / dataShards
+	base := headerSize + rsMetaSize
+	for i := 0; i < dataShards; i++ {
+		lo := i * shardSize
+		hi := lo + shardSize
+		if hi > len(payload) {
+			hi = len(payload)
+		}
+		got := blob[base+i*(rsShardHdrSize+shardSize)+rsShardHdrSize:]
+		if !bytes.Equal(got[:hi-lo], payload[lo:hi]) {
+			t.Errorf("L2 data shard %d differs from flat-payload reference", i)
+		}
+	}
+	if dec, err := Deserialize(blob, devBase(baseBlocks)); err != nil {
+		t.Fatalf("Deserialize(L2): %v", err)
+	} else if len(dec.dirty) != len(idxs) {
+		t.Fatalf("L2 roundtrip: got %d dirty blocks, want %d", len(dec.dirty), len(idxs))
+	}
+}

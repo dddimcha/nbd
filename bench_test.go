@@ -84,6 +84,17 @@ func BenchmarkSerializeL1(b *testing.B) {
 	}
 }
 
+func BenchmarkSerializeRS(b *testing.B) {
+	dev := benchDevice(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := dev.SerializeTier(TierL2); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkDeserializeL0(b *testing.B) {
 	dev := benchDevice(b)
 	blob, err := dev.SerializeTier(TierL0)

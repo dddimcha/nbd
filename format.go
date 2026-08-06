@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -84,7 +84,7 @@ func finalizeBad(dev *Device, bad []int64) []int64 {
 		}
 		out = append(out, b)
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
+	slices.Sort(out)
 	return out
 }
 
@@ -94,7 +94,7 @@ func (d *Device) sortedIndices() []int64 {
 	for i := range d.dirty {
 		idxs = append(idxs, i)
 	}
-	sort.Slice(idxs, func(a, b int) bool { return idxs[a] < idxs[b] })
+	slices.Sort(idxs)
 	return idxs
 }
 
@@ -194,13 +194,13 @@ func (d *Device) writeRecords(dst []byte, idxs []int64, recSize int, withCRC boo
 // L1 records and applies those that self-verify. Untrusted input never panics.
 func Deserialize(blob, base []byte) (*Device, error) {
 	if len(base)%BlockSize != 0 {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: base length %d not a multiple of block size %d: %w", len(base), BlockSize, ErrCorrupt)
 	}
 	if len(blob) < headerSize {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: blob length %d shorter than header %d: %w", len(blob), headerSize, ErrCorrupt)
 	}
 	if [4]byte(blob[0:4]) != magic || blob[4] != formatVersion {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: bad magic or format version: %w", ErrCorrupt)
 	}
 	wantCRC := binary.LittleEndian.Uint32(blob[14:18])
 	if crc32.ChecksumIEEE(blob[:14]) != wantCRC {
@@ -215,7 +215,7 @@ func Deserialize(blob, base []byte) (*Device, error) {
 		if t := Tier(blob[5]); t == TierL1 || t > TierL2 {
 			return deserializeHeaderless(blob, base)
 		}
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: header CRC mismatch: %w", ErrCorrupt)
 	}
 
 	tier := Tier(blob[5])

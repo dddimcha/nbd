@@ -27,6 +27,7 @@ package blockdevice
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"runtime"
 	"sync"
@@ -58,7 +59,8 @@ func rsDefaultShards(payloadLen int) (data, parity int) {
 	if data > rsDefaultData {
 		data = rsDefaultData
 	}
-	return data, rsDefaultParity
+	parity = rsDefaultParity
+	return data, parity
 }
 
 // SerializeRS encodes the dirty overlay at TierL2 with the given shard
@@ -78,7 +80,8 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 		}
 	}
 	if dataShards+parityShards > rsMaxShards {
-		return nil, ErrUnsupportedTier
+		return nil, fmt.Errorf("blockdevice: %d shards exceeds max %d: %w",
+			dataShards+parityShards, rsMaxShards, ErrUnsupportedTier)
 	}
 
 	shardSize := 0
@@ -111,9 +114,9 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 	// Fill the data shards in place (padding is the zero value already),
 	// then encode parity.
 	shards := make([][]byte, total)
-	base := headerSize + rsMetaSize
+	shardSectionOff := headerSize + rsMetaSize
 	for i := 0; i < total; i++ {
-		s := blob[base+i*(rsShardHdrSize+shardSize):]
+		s := blob[shardSectionOff+i*(rsShardHdrSize+shardSize):]
 		shards[i] = s[rsShardHdrSize : rsShardHdrSize+shardSize]
 	}
 	// The L1 record payload is written straight into the data-shard slots —
@@ -124,10 +127,11 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 	writeRecordsSharded(d, idxs, shards[:dataShards], shardSize)
 	enc, err := reedsolomon.New(dataShards, parityShards)
 	if err != nil {
-		return nil, ErrUnsupportedTier
+		return nil, fmt.Errorf("blockdevice: init reed-solomon encoder (%d+%d shards): %w: %w",
+			dataShards, parityShards, ErrUnsupportedTier, err)
 	}
 	if err := enc.Encode(shards); err != nil {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: reed-solomon encode: %w: %w", ErrCorrupt, err)
 	}
 	// Shard headers: index + CRC per shard. Each iteration touches only its
 	// own header and shard, so fanning out per shard keeps the output
@@ -137,7 +141,7 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			hdr := blob[base+i*(rsShardHdrSize+shardSize):]
+			hdr := blob[shardSectionOff+i*(rsShardHdrSize+shardSize):]
 			binary.LittleEndian.PutUint16(hdr[0:2], uint16(i))
 			binary.LittleEndian.PutUint32(hdr[2:6], crc32.ChecksumIEEE(shards[i]))
 		}(i)
@@ -217,11 +221,11 @@ func writeEmptyShardHeaders(dst []byte, total int) {
 // over base. Called from Deserialize after the outer header verified.
 func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error) {
 	if len(body) < rsMetaSize {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: body length %d shorter than rs meta %d: %w", len(body), rsMetaSize, ErrCorrupt)
 	}
 	meta := body[:rsMetaSize]
 	if crc32.ChecksumIEEE(meta[:16]) != binary.LittleEndian.Uint32(meta[16:20]) {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: rs meta CRC mismatch: %w", ErrCorrupt)
 	}
 	dataShards := int(binary.LittleEndian.Uint16(meta[0:2]))
 	parityShards := int(binary.LittleEndian.Uint16(meta[2:4]))
@@ -230,7 +234,7 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 	total := dataShards + parityShards
 
 	if dataShards < 1 || parityShards < 0 || total > rsMaxShards {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: invalid shard geometry %d+%d: %w", dataShards, parityShards, ErrCorrupt)
 	}
 	// A CRC-valid rsMeta is not a trustworthy rsMeta (CRC32 is not
 	// authentication), so its fields must also be internally consistent and
@@ -243,11 +247,11 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 	//     to ~75% of the blob; rsMaxDecodeAlloc stays as an absolute cap.
 	if payloadLen64%uint64(l1RecordSize) != 0 ||
 		payloadLen64/uint64(l1RecordSize) != blockCount {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: rs payload length %d inconsistent with block count %d: %w", payloadLen64, blockCount, ErrCorrupt)
 	}
 	if uint64(total)*uint64(shardSize) > rsMaxDecodeAlloc ||
 		payloadLen64 > uint64(dataShards)*uint64(shardSize) {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: rs shard geometry demands excessive or insufficient allocation: %w", ErrCorrupt)
 	}
 	payloadLen := int(payloadLen64)
 
@@ -255,13 +259,14 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 		return applyRecords(nil, TierL1, blockCount, base)
 	}
 	if shardSize == 0 {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: zero shard size with non-empty payload %d: %w", payloadLen, ErrCorrupt)
 	}
 	if shardSize != (payloadLen+dataShards-1)/dataShards {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: shard size %d inconsistent with payload %d over %d data shards: %w",
+			shardSize, payloadLen, dataShards, ErrCorrupt)
 	}
 	if uint64(total)*uint64(rsShardHdrSize+shardSize) > 4*uint64(len(body)) {
-		return nil, ErrCorrupt
+		return nil, fmt.Errorf("blockdevice: claimed shard section exceeds 4x body length %d: %w", len(body), ErrCorrupt)
 	}
 
 	// Parse the shard section; anything missing, truncated, misindexed or
@@ -289,7 +294,8 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 	if missing <= parityShards {
 		enc, err := reedsolomon.New(dataShards, parityShards)
 		if err != nil {
-			return nil, ErrCorrupt
+			return nil, fmt.Errorf("blockdevice: init reed-solomon decoder (%d+%d shards): %w: %w",
+				dataShards, parityShards, ErrCorrupt, err)
 		}
 		if err := enc.Reconstruct(shards); err == nil {
 			payload := make([]byte, 0, dataShards*shardSize)

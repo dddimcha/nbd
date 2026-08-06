@@ -15,5 +15,6 @@ RUN test -z "$(gofmt -l .)" \
 
 # Full gates: fast gates + fuzz smoke + bench smoke.
 FROM verify AS test
-RUN go test -run='^$' -fuzz=FuzzDeserialize -fuzztime=30s ./blockdevice \
+RUN go test -run='^$' -fuzz='^FuzzDeserialize$' -fuzztime=30s ./blockdevice \
+ && go test -run='^$' -fuzz='^FuzzDeserializeResealed$' -fuzztime=30s ./blockdevice \
  && go test -run='^$' -bench=. -benchtime=1x ./blockdevice

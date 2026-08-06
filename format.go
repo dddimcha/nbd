@@ -150,7 +150,11 @@ func (d *Device) writeRecordRange(dst []byte, idxs []int64, recSize int, withCRC
 // writeRecords is writeRecordRange fanned out over goroutines for large
 // deltas. Each worker owns a disjoint, position-determined slice of dst, so
 // the output bytes are identical to the sequential path regardless of
-// scheduling. Worker count is GOMAXPROCS capped so every worker serializes at
+// scheduling. This internal parallelism is race-free under the package's
+// "callers synchronize" contract: workers only read the dirty map and base
+// (no method mutates the Device while the caller honors the contract) and
+// write to disjoint, pre-computed regions of dst, joined by wg.Wait before
+// return. Worker count is GOMAXPROCS capped so every worker serializes at
 // least serialMinPerWorker records — below that the spawn/join overhead
 // outweighs the win and the sequential path runs instead.
 const serialMinPerWorker = 128

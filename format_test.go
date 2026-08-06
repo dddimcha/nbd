@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math/rand"
+	"runtime"
 	"testing"
 )
 
@@ -380,6 +381,16 @@ func TestSerializeParallelByteIdentity(t *testing.T) {
 	}
 	dev, _ := fmtDevice(t, baseBlocks, dirty)
 	idxs := dev.sortedIndices()
+
+	// This test is also the -race witness for the internal fan-out (see the
+	// concurrency contract in doc.go): confirm the delta is big enough to
+	// engage multiple workers, or the parallel path silently goes untested.
+	if len(idxs)/serialMinPerWorker < 2 {
+		t.Fatalf("delta too small to engage parallel writeRecords: %d records", len(idxs))
+	}
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Log("GOMAXPROCS < 2: parallel path degenerates to sequential on this run")
+	}
 
 	for _, tier := range []Tier{TierL0, TierL1} {
 		recSize := l0RecordSize

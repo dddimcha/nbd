@@ -17,6 +17,11 @@ var (
 
 // Device is an in-memory copy-on-write block device. The base data is never
 // modified; changed blocks live in a per-block dirty overlay.
+//
+// A Device is not safe for concurrent use by multiple goroutines: every
+// method, including ReadAt and Serialize, touches the dirty overlay that
+// WriteAt mutates, so callers must serialize access (as with bytes.Buffer).
+// Distinct Devices may be used concurrently even when they share a base.
 type Device struct {
 	base  []byte
 	dirty map[int64][]byte // block index -> BlockSize-byte copy

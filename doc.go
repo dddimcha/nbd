@@ -34,4 +34,14 @@
 // gaps and truncation. Deserialize never panics on untrusted input; it
 // returns ErrCorrupt when nothing is decodable and *PartialRecoveryError when
 // only part of the delta survived.
+//
+// # Concurrency
+//
+// A Device is not safe for concurrent use, like bytes.Buffer: callers that
+// share a Device across goroutines must serialize all method calls (including
+// read-only ones — ReadAt and Serialize observe the dirty map that WriteAt
+// mutates). Distinct Devices are independent, even when they share a base,
+// because the base is never written. Serialization internally fans out over
+// goroutines for large deltas; that parallelism is self-contained and needs
+// no caller synchronization beyond the single-caller rule above.
 package blockdevice

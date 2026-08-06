@@ -78,3 +78,21 @@ Round-trip and exact-size assertions per tier; a corruption matrix (bad header,
 bad record, truncation at every boundary, shuffled records, single/double bit
 flips); fuzzing on `Deserialize` — mutated input must never panic; benchmarks
 for all four operations.
+
+## Concurrency
+
+A `Device` is documented as not safe for concurrent use — callers synchronize
+— rather than carrying an internal mutex, following the `bytes.Buffer`
+precedent for low-level buffer types. The type is a thin overlay over a map;
+its expected embedding (one device per sandbox, driven by one I/O path) never
+shares an instance across goroutines, so an internal `RWMutex` would tax every
+`ReadAt`/`WriteAt` in the common single-caller case to protect against a usage
+pattern the design doesn't have, and it is far easier for a caller that does
+need sharing to add a lock than for one that doesn't to remove ours. Note that
+the contract covers *all* methods: `Serialize` reads the same dirty map
+`WriteAt` mutates, so even a "read-only" snapshot concurrent with a write is a
+data race. The internal goroutine fan-out in `writeRecords` /
+`writeRecordsSharded` needs no caller-visible locking: workers only read the
+dirty map and each writes a disjoint, position-determined output span, joined
+before the method returns — `TestSerializeParallelByteIdentity` exercises this
+path under `-race` in the standard gates.

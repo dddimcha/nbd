@@ -181,7 +181,9 @@ func writeRecordRangeSharded(d *Device, idxs []int64, shards [][]byte, shardSize
 // writeRecordsSharded is writeRecordRangeSharded fanned out over goroutines
 // for large deltas, mirroring writeRecords in format.go: each worker owns the
 // payload byte range determined solely by its record positions, so output is
-// deterministic regardless of scheduling.
+// deterministic regardless of scheduling. Race-free under the package's
+// "callers synchronize" contract: workers only read the dirty map and write
+// disjoint shard spans, joined by wg.Wait before return.
 func writeRecordsSharded(d *Device, idxs []int64, shards [][]byte, shardSize int) {
 	workers := runtime.GOMAXPROCS(0)
 	if max := len(idxs) / serialMinPerWorker; workers > max {

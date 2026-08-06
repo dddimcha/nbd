@@ -21,6 +21,10 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+	if os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "-help" {
+		fmt.Fprint(os.Stdout, usage)
+		os.Exit(0)
+	}
 	cmds := map[string]func([]string, io.Writer, io.Writer) int{
 		"diff": cmdDiff, "apply": cmdApply, "inspect": cmdInspect,
 	}

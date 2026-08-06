@@ -14,18 +14,11 @@ func cmdDiff(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	out := fs.String("o", "", "output delta path (required)")
 	tier := fs.Int("tier", 0, "serialization tier: 0 (bare), 1 (CRC), 2 (Reed-Solomon)")
-	// Accept flags after positionals: "bdev diff a b -o d" — parse twice.
-	if err := fs.Parse(args); err != nil {
-		return 2
+	pos, code := parseArgs(fs, args, 2, "usage: bdev diff <base> <modified> -o <delta> [-tier 0|1|2]", stdout, stderr)
+	if pos == nil {
+		return code
 	}
-	pos := fs.Args()
-	if len(pos) >= 2 {
-		if err := fs.Parse(pos[2:]); err != nil {
-			return 2
-		}
-		pos = pos[:2]
-	}
-	if len(pos) != 2 || *out == "" {
+	if *out == "" {
 		return fail(stderr, 2, "diff needs <base> <modified> and -o <delta>")
 	}
 	if *tier < 0 || *tier > 2 {

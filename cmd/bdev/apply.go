@@ -15,17 +15,11 @@ func cmdApply(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	out := fs.String("o", "", "output image path (required)")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	pos, code := parseArgs(fs, args, 2, "usage: bdev apply <base> <delta> -o <out>", stdout, stderr)
+	if pos == nil {
+		return code
 	}
-	pos := fs.Args()
-	if len(pos) >= 2 {
-		if err := fs.Parse(pos[2:]); err != nil {
-			return 2
-		}
-		pos = pos[:2]
-	}
-	if len(pos) != 2 || *out == "" {
+	if *out == "" {
 		return fail(stderr, 2, "apply needs <base> <delta> and -o <out>")
 	}
 	base, err := loadImage(pos[0])
@@ -49,8 +43,8 @@ func cmdApply(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, 1, "%v", err)
 	}
 	if partial != nil {
-		fmt.Fprintf(stderr, "bdev: partial recovery — %d block(s) degraded to base: %v\n",
-			len(partial.BadBlocks), partial.BadBlocks)
+		fmt.Fprintf(stderr, "bdev: partial recovery — %d block(s) degraded to base: %v (unattributed loss: %v)\n",
+			len(partial.BadBlocks), partial.BadBlocks, partial.Truncated)
 		return 3
 	}
 	return 0

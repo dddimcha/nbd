@@ -11,6 +11,8 @@ filesystem.
 ## API
 
 ```go
+import "github.com/dddimcha/nbd/blockdevice"
+
 dev := blockdevice.New(base)              // base length divisible by 4096
 dev.ReadAt(p, off)                        // off, len(p) block-aligned
 dev.WriteAt(p, off)
@@ -28,13 +30,25 @@ dev2, _ := blockdevice.Deserialize(blob, base)
 
 Every record carries its own block index, so a decoder survives reordering,
 gaps and truncation; a corrupt block degrades to the base content instead of
-failing the whole device. See [DESIGN.md](DESIGN.md) for the exact formats and
+failing the whole device. See [DESIGN.md](docs/DESIGN.md) for the exact formats and
 trade-offs.
+
+## Layout
+
+```
+blockdevice/        the Go package (core, wire format, RS tier, tests)
+docs/               DESIGN.md — formats, trade-offs, concurrency contract
+scripts/            gates.sh — quality-gate runner
+build/              Dockerfile — reproducible build & test stages
+.github/workflows/  CI: fmt, vet, race tests, fuzz + bench smoke
+.claude/            agent roles and vendored engineering skills
+```
 
 ## Development
 
 ```
-go test -race ./...
-go vet ./...
-go test -fuzz=FuzzDeserialize -fuzztime=30s ./...
+make verify        # fast gates: fmt, vet, race tests
+make test          # + 30s fuzz + bench smoke
+make bench         # benchmarks with allocation stats
+make docker-test   # full gates in a clean container (no local Go needed)
 ```

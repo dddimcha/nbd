@@ -20,10 +20,10 @@ go test -race ./...
 
 if [[ "${1:-}" == "--full" ]]; then
   echo "==> fuzz (FuzzDeserialize, 30s)"
-  go test -run='^$' -fuzz=FuzzDeserialize -fuzztime=30s .
+  go test -run='^$' -fuzz=FuzzDeserialize -fuzztime=30s ./blockdevice
 
   echo "==> bench (smoke, 1x)"
-  go test -run='^$' -bench=. -benchtime=1x .
+  go test -run='^$' -bench=. -benchtime=1x ./blockdevice
 fi
 
 echo "ALL GATES PASSED"

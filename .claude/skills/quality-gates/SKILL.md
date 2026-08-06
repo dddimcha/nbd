@@ -18,8 +18,8 @@ Run from the repo root, in this order:
 | 1 | Format | `gofmt -l .` | Output is EMPTY |
 | 2 | Vet | `go vet ./...` | Exit 0 |
 | 3 | Tests + race | `go test -race ./...` | Exit 0 |
-| 4 | Fuzz | `go test -run='^$' -fuzz=FuzzDeserialize -fuzztime=30s .` | No crasher in 30s |
-| 5 | Bench smoke | `go test -run='^$' -bench=. -benchtime=1x .` | Exit 0 (compiles + runs, not perf) |
+| 4 | Fuzz | `go test -run='^$' -fuzz=FuzzDeserialize -fuzztime=30s ./blockdevice` | No crasher in 30s |
+| 5 | Bench smoke | `go test -run='^$' -bench=. -benchtime=1x ./blockdevice` | Exit 0 (compiles + runs, not perf) |
 
 Shortcut:
 

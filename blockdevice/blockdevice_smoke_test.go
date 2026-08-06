@@ -97,8 +97,10 @@ func TestL1CorruptRecordPartialRecovery(t *testing.T) {
 	if !errors.As(err, &pre) {
 		t.Fatalf("want *PartialRecoveryError, got %v", err)
 	}
-	if len(pre.BadBlocks) != 1 || pre.BadBlocks[0] != 1 {
-		t.Fatalf("BadBlocks = %v, want [1]", pre.BadBlocks)
+	// The record CRC covers index+data, so a failed record's index is
+	// untrusted: the loss is unattributed, never blamed on a block.
+	if len(pre.BadBlocks) != 0 || !pre.Truncated {
+		t.Fatalf("got BadBlocks=%v Truncated=%v, want none/true", pre.BadBlocks, pre.Truncated)
 	}
 	if dev2 == nil {
 		t.Fatal("device should still be returned on partial recovery")

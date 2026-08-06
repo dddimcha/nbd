@@ -45,7 +45,10 @@ func TestInspectL1BadBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(info.BadBlocks) != 1 || info.BadBlocks[0] != 0 {
-		t.Fatalf("want BadBlocks [0], got %v", info.BadBlocks)
+	// The record CRC covers index+data, so the failed record's index is
+	// unreadable: the loss is counted, not attributed to a block.
+	if len(info.BadBlocks) != 0 || info.UnattributedLoss != 1 || !info.Truncated {
+		t.Fatalf("got BadBlocks=%v UnattributedLoss=%d Truncated=%v, want none/1/true",
+			info.BadBlocks, info.UnattributedLoss, info.Truncated)
 	}
 }

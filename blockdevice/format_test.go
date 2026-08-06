@@ -228,8 +228,10 @@ func TestL1CorruptRecordCRC(t *testing.T) {
 	if !errors.As(err, &pre) {
 		t.Fatalf("want *PartialRecoveryError, got %v", err)
 	}
-	if len(pre.BadBlocks) != 1 || pre.BadBlocks[0] != 3 {
-		t.Fatalf("BadBlocks = %v, want [3]", pre.BadBlocks)
+	// The CRC covers index+data, so a failed record's index is unreadable:
+	// the loss is unattributed (Truncated), never blamed on a block index.
+	if len(pre.BadBlocks) != 0 || !pre.Truncated {
+		t.Fatalf("got BadBlocks=%v Truncated=%v, want none/true", pre.BadBlocks, pre.Truncated)
 	}
 	// Bad block reads as base; good records applied.
 	expectBlock(t, dev2, base, 3, nil)

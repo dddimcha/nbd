@@ -48,14 +48,26 @@ var (
 // read as base data.
 type PartialRecoveryError struct {
 	// BadBlocks lists the unrecoverable block indices, sorted ascending and
-	// deduplicated. A block that was ultimately recovered (e.g. a duplicate
-	// record with an intact copy) is never listed.
+	// deduplicated. A block is listed only when its index is trustworthy:
+	// either the loss was structural (a cut-off tail or lost shard region
+	// whose 8-byte index field is still readable) with the index in base
+	// range, and the block was not recovered elsewhere. Records whose CRC
+	// failed are NOT attributed here — the CRC covers index and data alike,
+	// so a failed CRC means the index itself is unreadable; such losses are
+	// reported via Truncated instead. A block that was ultimately recovered
+	// (e.g. a duplicate record with an intact copy) is never listed.
 	BadBlocks []int64
-	// Truncated reports that data was lost without a nameable block index:
-	// a cut-off tail whose index bytes are unreadable, surplus bytes beyond
-	// the header's blockCount, an unverifiable header, or shard regions lost
-	// beyond repair. Every non-nil PartialRecoveryError has at least one
-	// BadBlocks entry or Truncated set (or both).
+	// Truncated reports that data was lost without a trustworthy block
+	// index: a record whose CRC failed (index unverifiable), a cut-off tail
+	// whose index bytes are unreadable, surplus bytes beyond the header's
+	// blockCount, an unverifiable header, or shard regions lost beyond
+	// repair. As a heuristic, a CRC-failed record whose (unverified) index
+	// bytes name a block that another, intact record successfully applied is
+	// treated as superseded and reported as no loss at all — the index is
+	// unverified, so this suppression happens ONLY when the read index
+	// matches an applied block; in every other case Truncated is set. Every
+	// non-nil PartialRecoveryError has at least one BadBlocks entry or
+	// Truncated set (or both).
 	Truncated bool
 }
 
@@ -247,9 +259,10 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 
 	dev := New(base)
 	maxBlock := int64(len(base) / BlockSize)
-	var bad []int64
-	partial := false      // anything was skipped, lost, or surplus
-	unattributed := false // loss with no nameable block index
+	var bad []int64       // structurally lost blocks with a readable, in-range index
+	var skipped []int64   // read-but-UNVERIFIED indices of CRC-failed records
+	unattributed := false // loss with no trustworthy block index
+	tailIdx, tailNamed := int64(0), false
 
 	// The header CRC covers layout, not content, so blockCount is an upper
 	// bound the body must honor: exactly blockCount records are applied and
@@ -259,16 +272,16 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 	n := len(body) / recSize
 	if uint64(n) >= blockCount {
 		if uint64(n) > blockCount || len(body)%recSize != 0 {
-			partial, unattributed = true, true
+			unattributed = true
 			n = int(blockCount)
 		}
 	} else {
-		partial = true
 		// If the partial tail carries a readable index, report it;
 		// otherwise the loss is unattributable.
 		if tail := body[n*recSize:]; len(tail) >= 8 {
 			if idx := int64(binary.LittleEndian.Uint64(tail[0:8])); idx >= 0 && idx < maxBlock {
 				bad = append(bad, idx)
+				tailIdx, tailNamed = idx, true
 			} else {
 				unattributed = true
 			}
@@ -302,17 +315,15 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 		if tier == TierL1 {
 			want := binary.LittleEndian.Uint32(rec[8+BlockSize:])
 			if crc32.ChecksumIEEE(rec[:8+BlockSize]) != want {
-				partial = true // any skipped record makes recovery partial
-				if idx >= 0 && idx < maxBlock {
-					bad = append(bad, idx)
-				} else {
-					unattributed = true
-				}
+				// The CRC covers index+data, so the index is unverified —
+				// do NOT blame the block it names. Remember the read index
+				// only for the superseded-duplicate heuristic below.
+				skipped = append(skipped, idx)
 				continue
 			}
 		}
 		if idx < 0 || idx >= maxBlock {
-			partial, unattributed = true, true
+			unattributed = true
 			continue
 		}
 		b := arena[i*BlockSize : (i+1)*BlockSize : (i+1)*BlockSize]
@@ -320,16 +331,31 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 		dev.dirty[idx] = b
 	}
 
-	bad = finalizeBad(dev, bad)
-	if partial || len(bad) > 0 {
-		// Invariant: a non-nil PartialRecoveryError carries at least one
-		// BadBlocks entry or Truncated (see the type doc).
-		if len(bad) == 0 {
+	// Superseded-duplicate heuristic (see PartialRecoveryError doc): a
+	// CRC-failed record whose read index names a block another record
+	// successfully applied is counted as no loss; any other skip is
+	// unattributable loss.
+	for _, s := range skipped {
+		if s >= 0 && s < maxBlock {
+			if _, applied := dev.dirty[s]; applied {
+				continue
+			}
+		}
+		unattributed = true
+	}
+	// A truncated tail is structural loss even when its named block was
+	// applied by an earlier record: the cut-off (newer duplicate) copy is
+	// gone, so finalizeBad dropping the entry must not silence the error.
+	if tailNamed {
+		if _, applied := dev.dirty[tailIdx]; applied {
 			unattributed = true
 		}
-		return dev, &PartialRecoveryError{BadBlocks: bad, Truncated: unattributed}
 	}
-	return dev, nil
+	bad = finalizeBad(dev, bad)
+	if len(bad) == 0 && !unattributed {
+		return dev, nil
+	}
+	return dev, &PartialRecoveryError{BadBlocks: bad, Truncated: unattributed}
 }
 
 // deserializeHeaderless handles a blob whose header CRC failed: if the body
@@ -343,7 +369,6 @@ func deserializeHeaderless(blob, base []byte) (*Device, error) {
 	}
 	dev := New(base)
 	maxBlock := int64(len(base) / BlockSize)
-	var bad []int64
 	recovered := 0
 	// Same pre-sizing and single-arena strategy as applyRecords; see the
 	// aliasing/pinning notes there. Sizing follows len(body), so hostile
@@ -356,9 +381,9 @@ func deserializeHeaderless(blob, base []byte) (*Device, error) {
 		idx := int64(binary.LittleEndian.Uint64(rec[0:8]))
 		want := binary.LittleEndian.Uint32(rec[8+BlockSize:])
 		if crc32.ChecksumIEEE(rec[:8+BlockSize]) != want || idx < 0 || idx >= maxBlock {
-			if idx >= 0 && idx < maxBlock {
-				bad = append(bad, idx)
-			}
+			// A record that fails its CRC has an unverified index (the CRC
+			// covers index+data), so no block is blamed; the header being
+			// unverifiable already sets Truncated for the whole result.
 			continue
 		}
 		r := i / l1RecordSize
@@ -371,6 +396,7 @@ func deserializeHeaderless(blob, base []byte) (*Device, error) {
 		return nil, ErrCorrupt
 	}
 	// The header itself is unverifiable, so completeness is unknowable:
-	// Truncated is always set on this path.
-	return dev, &PartialRecoveryError{BadBlocks: finalizeBad(dev, bad), Truncated: true}
+	// Truncated is always set on this path and no block is ever blamed
+	// (every skip stems from an unverified record).
+	return dev, &PartialRecoveryError{Truncated: true}
 }

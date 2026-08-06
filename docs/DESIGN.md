@@ -62,22 +62,39 @@ default and integrity is opt-in via the header tier byte.
 
 ### Shard geometry bounds
 
-`reedsolomon.New` does O(shards³)-ish matrix setup regardless of payload
-size, so shard counts must be justified by the payload or a tiny hostile blob
-becomes a CPU multiplier (a ~6 KB blob claiming 254+2 shards cost tens of
-milliseconds to reject, pre-bound). Both `SerializeRS` (encode) and
-`parseRSMeta` (decode — so `Deserialize` and `Inspect` alike) enforce the
-same rule, keeping every encodable blob decodable:
+`reedsolomon.New` does O(total³) matrix setup, where total = data+parity
+shards, regardless of payload size. The shard COUNT is therefore the CPU
+multiplier, and a payload-proportional rule alone does not bound it: a 33 KB
+payload "justifies" 254 data shards under the 128-bytes-per-shard rule, and
+254+2 costs ~78 ms per decode — hostile blobs at that geometry are a real
+amplification vector. The primary defense is an absolute cap:
+
+```
+dataShards + parityShards <= 64
+```
+
+64³ matrix work is sub-millisecond in the worst case, and all default
+geometries (N = min(10, max(1, payloadLen/4096)) data + 2 parity) fit with
+wide margin. On top of the cap, the payload-justification rule remains as a
+secondary tightening, so tiny payloads cannot be sliced into slivers either:
 
 ```
 dataShards   >= 1
 dataShards   <= max(1, ceil(payloadLen/128))   // >=128 payload bytes per data shard
 parityShards <= max(2, dataShards)
-dataShards + parityShards <= 256               // classic RS limit
 ```
 
-Violations are `ErrUnsupportedTier` on encode and `ErrCorrupt` on decode,
-raised before any allocation or matrix work.
+Both `SerializeRS` (encode) and `parseRSMeta` (decode — so `Deserialize` and
+`Inspect` alike) enforce the identical predicate, keeping every encodable
+blob decodable. Violations are `ErrUnsupportedTier` on encode and
+`ErrCorrupt` on decode, raised before any allocation or matrix work.
+
+A side effect of cap + justification worth noting: a data shard consisting
+purely of zero padding can no longer exist on the wire — padding is always
+`N*shardSize - payloadLen < N <= 62` bytes, while every shard is at least
+~128 bytes — so the salvage path's "lost shard held only padding" full
+recovery is reachable only through internal callers, not through any blob
+`parseRSMeta` accepts.
 
 Word-wise Hamming SECDED was considered as a zero-dependency middle tier and
 rejected: at 12.5% overhead it only repairs scattered bit flips, while the

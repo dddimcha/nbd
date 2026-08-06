@@ -1,6 +1,7 @@
 package blockdevice
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -38,9 +39,12 @@ type Info struct {
 	// a readable index: L1/L2 records whose CRC failed (the CRC covers
 	// index+data, so the index is unreadable), L2 records whose index bytes
 	// lie in a lost shard, and headerless-scan records that did not
-	// self-verify. Like Deserialize, a CRC-failed record whose read index
-	// matches a record that did verify is treated as superseded and not
-	// counted.
+	// self-verify. Like Deserialize, a CRC-failed record is suppressed as a
+	// harmless true duplicate ONLY when its data bytes are bit-identical to
+	// those of a verified record carrying its read index; the residual
+	// window is the same as documented on PartialRecoveryError.Truncated —
+	// false suppression requires the failed record's data to exactly equal
+	// the verified record's data.
 	UnattributedLoss int
 	// Truncated reports structural damage: a cut-off or surplus body
 	// relative to the header's blockCount, an unverifiable header (the
@@ -140,27 +144,27 @@ func finishInfo(info *Info) {
 // scanL1Records walks a whole-record L1 payload. CRC-verified records with a
 // negative (impossible-in-any-base) index are reported in bad; CRC-failed
 // records have an unreadable index and are counted as unattributed loss,
-// except when their read index matches a record that did verify (superseded
-// duplicate, mirroring Deserialize).
+// except when their data bytes are bit-identical to a verified record
+// carrying their read index (true duplicate, mirroring Deserialize).
 func scanL1Records(body []byte) (bad []int64, unattributed int) {
-	applied := make(map[int64]bool)
-	var skipped []int64
+	applied := make(map[int64][]byte)
+	var skipped []skippedRec
 	for off := 0; off+l1RecordSize <= len(body); off += l1RecordSize {
 		rec := body[off : off+l1RecordSize]
 		idx := int64(binary.LittleEndian.Uint64(rec[0:8]))
 		want := binary.LittleEndian.Uint32(rec[8+BlockSize:])
 		if crc32.ChecksumIEEE(rec[:8+BlockSize]) != want {
-			skipped = append(skipped, idx)
+			skipped = append(skipped, skippedRec{idx: idx, data: rec[8 : 8+BlockSize]})
 			continue
 		}
 		if idx < 0 {
 			bad = append(bad, idx)
 			continue
 		}
-		applied[idx] = true
+		applied[idx] = rec[8 : 8+BlockSize]
 	}
 	for _, s := range skipped {
-		if !applied[s] {
+		if a, ok := applied[s.idx]; !ok || !bytes.Equal(a, s.data) {
 			unattributed++
 		}
 	}
@@ -225,8 +229,9 @@ func inspectRS(info *Info, body []byte) error {
 		// fall through to the salvage walk, like deserializeRS.
 	}
 
-	applied := make(map[int64]bool)
-	var skipped, lostNamed []int64
+	applied := make(map[int64][]byte)
+	var skipped []skippedRec
+	var lostNamed []int64
 	rec := make([]byte, l1RecordSize)
 	for lo := 0; lo+l1RecordSize <= g.payloadLen; lo += l1RecordSize {
 		if readShardSpan(shards, g.dataShards, g.shardSize, rec, lo) {
@@ -234,11 +239,13 @@ func inspectRS(info *Info, body []byte) error {
 			want := binary.LittleEndian.Uint32(rec[8+BlockSize:])
 			switch {
 			case crc32.ChecksumIEEE(rec[:8+BlockSize]) != want:
-				skipped = append(skipped, idx) // index unverified
+				// Index unverified; keep a copy of the data (rec is
+				// reused) for the true-duplicate check.
+				skipped = append(skipped, skippedRec{idx: idx, data: bytes.Clone(rec[8 : 8+BlockSize])})
 			case idx < 0:
 				info.BadBlocks = append(info.BadBlocks, idx)
 			default:
-				applied[idx] = true
+				applied[idx] = bytes.Clone(rec[8 : 8+BlockSize])
 			}
 			continue
 		}
@@ -250,12 +257,12 @@ func inspectRS(info *Info, body []byte) error {
 		}
 	}
 	for _, s := range skipped {
-		if !applied[s] {
+		if a, ok := applied[s.idx]; !ok || !bytes.Equal(a, s.data) {
 			info.UnattributedLoss++
 		}
 	}
 	for _, s := range lostNamed {
-		if applied[s] {
+		if _, ok := applied[s]; ok {
 			// The lost copy's block was applied from a duplicate record, but
 			// the lost content itself is gone — structural loss.
 			info.UnattributedLoss++

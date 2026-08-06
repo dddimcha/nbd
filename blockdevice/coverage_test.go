@@ -348,11 +348,40 @@ func TestRSForgedMetaRejected(t *testing.T) {
 	}
 }
 
-// Salvage full-recovery path: with 254 data shards over eight 4108-byte
-// records (payload 32864, within the geometry bound dataShards <=
-// ceil(payloadLen/128)), shardSize is 130 and the last data shard is pure
-// padding. Losing it plus both parity shards exceeds K, forcing salvage — but
-// every record still decodes, so recovery is complete and err must be nil.
+// covL1Payload serializes dev at TierL1 and returns the record payload
+// (header stripped), for building rsSalvage inputs directly.
+func covL1Payload(t *testing.T, dev *Device) []byte {
+	t.Helper()
+	blob, err := dev.SerializeTier(TierL1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return blob[headerSize:]
+}
+
+// covPayloadShards slices an L1 payload into dataShards record-aligned
+// shards of shardSize bytes each (the tail shard, if beyond the payload, is
+// zero padding), returning a shard slice suitable for rsSalvage.
+func covPayloadShards(payload []byte, dataShards, shardSize int) [][]byte {
+	shards := make([][]byte, dataShards)
+	for i := range shards {
+		s := make([]byte, shardSize)
+		if off := i * shardSize; off < len(payload) {
+			copy(s, payload[off:])
+		}
+		shards[i] = s
+	}
+	return shards
+}
+
+// Salvage full-recovery path: a lost data shard that held only zero padding
+// loses no record bytes, so every record still decodes and err must be nil.
+//
+// NOTE: with the rsMaxTotalShards=64 cap plus the 128-bytes-per-shard
+// justification rule, no wire-format geometry can place a whole data shard
+// in padding anymore (padding is always < dataShards <= 62 bytes while every
+// shard is >= ~128 bytes), so this exercises rsSalvage directly with a
+// geometry of one record per 4108-byte shard and a ninth, padding-only shard.
 func TestRSSalvageFullRecoveryWhenLostShardsArePadding(t *testing.T) {
 	base := covBase(16)
 	dev := New(base)
@@ -361,18 +390,11 @@ func TestRSSalvageFullRecoveryWhenLostShardsArePadding(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	blob, err := dev.SerializeRS(254, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	shardSize := int(binary.LittleEndian.Uint32(blob[headerSize+4 : headerSize+8]))
-	if 253*shardSize < 8*l1RecordSize {
-		t.Fatalf("test premise broken: last data shard carries payload (shardSize=%d)", shardSize)
-	}
-	covKillShard(t, blob, shardSize, 253) // padding-only data shard
-	covKillShard(t, blob, shardSize, 254) // parity
-	covKillShard(t, blob, shardSize, 255) // parity
-	dev2, err := Deserialize(blob, base)
+	payload := covL1Payload(t, dev) // 8 records, 4108 bytes each
+	shards := covPayloadShards(payload, 9, l1RecordSize)
+	shards[8] = nil // lost shard: pure padding, no record bytes
+
+	dev2, err := rsSalvage(shards, 9, l1RecordSize, len(payload), base)
 	if err != nil {
 		t.Fatalf("want full recovery, got %v", err)
 	}

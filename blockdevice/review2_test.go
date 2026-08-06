@@ -78,17 +78,62 @@ func TestSerializeRSRejectsUnjustifiedGeometry(t *testing.T) {
 	if _, err := dev.SerializeRS(1, 200); !errors.Is(err, ErrUnsupportedTier) {
 		t.Fatalf("SerializeRS(1,200): err = %v, want ErrUnsupportedTier", err)
 	}
-	// A payload-justified custom geometry still round-trips.
+	// Even a payload-justified 254+2 is rejected now: the absolute
+	// rsMaxTotalShards=64 cap binds regardless of payload (a 33 KB payload
+	// clears the 128-bytes-per-shard rule at N=254, but reedsolomon.New at
+	// that count is O(total^3) CPU per decode).
 	dev8, base := fmtDevice(t, 16, []int64{1, 2, 3, 4, 5, 6, 7, 8})
-	blob, err := dev8.SerializeRS(254, 2) // 8 records = 32864 bytes >= 253*128+1
+	if _, err := dev8.SerializeRS(254, 2); !errors.Is(err, ErrUnsupportedTier) {
+		t.Fatalf("SerializeRS(254,2) over 8 records: err = %v, want ErrUnsupportedTier (total > 64)", err)
+	}
+	// A payload-justified geometry within the cap still round-trips.
+	blob, err := dev8.SerializeRS(62, 2) // total 64; 8 records = 32864 bytes >= 61*128+1
 	if err != nil {
-		t.Fatalf("SerializeRS(254,2) over 8 records: %v", err)
+		t.Fatalf("SerializeRS(62,2) over 8 records: %v", err)
 	}
 	dec, err := Deserialize(blob, base)
 	if err != nil {
 		t.Fatalf("Deserialize: %v", err)
 	}
 	expectBlock(t, dec, base, 3, fill(0x43))
+}
+
+// Shard-cap regression: the worst legal geometry (62+2, total 64) at its
+// minimal justifying payload must decode in well under 5 ms — the whole
+// point of the cap — while 254+2 is rejected on both sides even when
+// payload-justified (pre-cap it cost ~78 ms of reedsolomon.New per decode).
+func TestRSShardCapWorstCaseFast(t *testing.T) {
+	// 2 records = 8216 payload bytes: the smallest record count with
+	// 62 <= ceil(payload/128), so 62+2 is the worst geometry a legal blob
+	// can demand per payload byte.
+	dev, base := fmtDevice(t, 16, []int64{1, 2})
+	blob, err := dev.SerializeRS(62, 2)
+	if err != nil {
+		t.Fatalf("SerializeRS(62,2): %v", err)
+	}
+	start := time.Now()
+	dec, err := Deserialize(blob, base)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Deserialize: %v", err)
+	}
+	// The 5ms bound holds only without the race detector's ~10-40x
+	// instrumentation overhead; the functional assertions run either way.
+	if !raceEnabled && elapsed > 5*time.Millisecond {
+		t.Fatalf("62+2 decode took %v, want < 5ms", elapsed)
+	}
+	expectBlock(t, dec, base, 1, fill(0x41))
+	expectBlock(t, dec, base, 2, fill(0x42))
+
+	// Decode side of the cap: a well-formed 254+2 blob over a justifying
+	// payload (8 records) is ErrCorrupt for Deserialize and Inspect alike.
+	hostile := hostileRSBlob(t, 254, 2, 8)
+	if _, err := Deserialize(hostile, base); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Deserialize(254+2 over 8 records): err = %v, want ErrCorrupt", err)
+	}
+	if _, err := Inspect(hostile); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Inspect(254+2 over 8 records): err = %v, want ErrCorrupt", err)
+	}
 }
 
 // P1-2: on an L1 record whose CRC fails, the decoder must not trust the
@@ -121,10 +166,15 @@ func TestL1CorruptIndexDoesNotBlameReadIndex(t *testing.T) {
 	expectBlock(t, got, base, 7, nil) // block 7 degrades to base
 }
 
-// P1-3: duplicate records for the same block where the corrupt copy's read
-// index matches the intact copy's applied block = superseded, full recovery,
-// nil error. The opposite direction (no intact copy) stays a Truncated
-// partial recovery.
+// P1-3 (tightened): a CRC-failed record is suppressed as a harmless
+// duplicate ONLY when its data bytes are bit-identical to the record applied
+// for its read index. The honest matrix:
+//
+//   - genuine duplicate, damage confined to the CRC (or index) bytes, data
+//     identical to the applied copy  -> suppressed, nil error;
+//   - duplicate with CORRUPT DATA (the old rule's false-suppression window)
+//     -> Truncated: content differing from the applied copy is real loss;
+//   - no intact copy at all -> Truncated.
 func TestL1SupersededDuplicateIsFullRecovery(t *testing.T) {
 	dev, base := fmtDevice(t, 8, []int64{3})
 	single, err := dev.SerializeTier(TierL1)
@@ -132,8 +182,6 @@ func TestL1SupersededDuplicateIsFullRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	goodRec := single[headerSize:]
-	badRec := bytes.Clone(goodRec)
-	badRec[8] ^= 0xFF // corrupt data; CRC fails, index still reads 3
 
 	mk := func(recs ...[]byte) []byte {
 		blob := bytes.Clone(single[:headerSize])
@@ -144,17 +192,8 @@ func TestL1SupersededDuplicateIsFullRecovery(t *testing.T) {
 		}
 		return blob
 	}
-
-	t.Run("superseded: nil error", func(t *testing.T) {
-		got, err := Deserialize(mk(badRec, goodRec), base)
-		if err != nil {
-			t.Fatalf("corrupt copy superseded by intact copy: err = %v, want nil", err)
-		}
-		expectBlock(t, got, base, 3, fill(0x43))
-	})
-
-	t.Run("not superseded: Truncated", func(t *testing.T) {
-		got, err := Deserialize(mk(badRec), base)
+	wantTruncatedNoBad := func(t *testing.T, err error) *PartialRecoveryError {
+		t.Helper()
 		var pre *PartialRecoveryError
 		if !errors.As(err, &pre) {
 			t.Fatalf("err = %v, want *PartialRecoveryError", err)
@@ -162,43 +201,126 @@ func TestL1SupersededDuplicateIsFullRecovery(t *testing.T) {
 		if len(pre.BadBlocks) != 0 || !pre.Truncated {
 			t.Fatalf("got BadBlocks=%v Truncated=%v, want none/true", pre.BadBlocks, pre.Truncated)
 		}
+		return pre
+	}
+
+	t.Run("true duplicate (CRC bytes hit, data identical): nil error", func(t *testing.T) {
+		badRec := bytes.Clone(goodRec)
+		badRec[l1RecordSize-1] ^= 0xFF // CRC fails; index and data intact
+		got, err := Deserialize(mk(badRec, goodRec), base)
+		if err != nil {
+			t.Fatalf("bit-identical duplicate: err = %v, want nil", err)
+		}
+		expectBlock(t, got, base, 3, fill(0x43))
+	})
+
+	t.Run("duplicate with corrupt data: Truncated, not suppressed", func(t *testing.T) {
+		badRec := bytes.Clone(goodRec)
+		badRec[8] ^= 0xFF // corrupt data; CRC fails, index still reads 3
+		got, err := Deserialize(mk(badRec, goodRec), base)
+		wantTruncatedNoBad(t, err)
+		expectBlock(t, got, base, 3, fill(0x43)) // intact copy still applied
+	})
+
+	t.Run("no intact copy: Truncated", func(t *testing.T) {
+		badRec := bytes.Clone(goodRec)
+		badRec[8] ^= 0xFF
+		got, err := Deserialize(mk(badRec), base)
+		wantTruncatedNoBad(t, err)
 		expectBlock(t, got, base, 3, nil)
 	})
 }
 
-// P1-3 (rs.go): the same superseded rule in the salvage path. Geometry as in
-// TestRSSalvageFullRecoveryWhenLostShardsArePadding (lost shards carry only
-// padding/parity), plus record 0's index edited 1 -> 2 without fixing its
-// record CRC: the skipped record's read index names applied block 2, so the
-// blob is fully recovered and err must be nil (pre-fix: an empty bad list
-// forced Truncated).
+// Regression for the silent-loss window the old superseded heuristic left
+// open: a one-byte flip in a record's INDEX bytes (5 -> 6, CRC fails) used
+// to make the loss look like a superseded duplicate of applied block 6 —
+// Deserialize returned nil and block 5 silently read base. Now the data
+// comparison fails (block 6's content differs), so the loss is reported:
+// non-nil PartialRecoveryError with Truncated, block 5 reads base, block 6
+// intact, and Inspect reports the loss too.
+func TestL1IndexFlipIsReportedLoss(t *testing.T) {
+	dev, base := fmtDevice(t, 8, []int64{5, 6})
+	blob, err := dev.SerializeTier(TierL1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record 0 is block 5 (records sorted by index). Flip its index 5 -> 6
+	// WITHOUT resealing the record CRC.
+	binary.LittleEndian.PutUint64(blob[headerSize:headerSize+8], 6)
+
+	got, err := Deserialize(blob, base)
+	var pre *PartialRecoveryError
+	if !errors.As(err, &pre) {
+		t.Fatalf("err = %v, want *PartialRecoveryError (silently swallowed loss)", err)
+	}
+	if !pre.Truncated {
+		t.Error("index-flipped record with differing data must set Truncated")
+	}
+	if len(pre.BadBlocks) != 0 {
+		t.Errorf("BadBlocks = %v, want none (index unverified)", pre.BadBlocks)
+	}
+	expectBlock(t, got, base, 5, nil)        // lost write degrades to base
+	expectBlock(t, got, base, 6, fill(0x46)) // intact record applied
+
+	info, err := Inspect(blob)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if info.UnattributedLoss == 0 || !info.Truncated {
+		t.Errorf("Inspect got UnattributedLoss=%d Truncated=%v, want >0/true", info.UnattributedLoss, info.Truncated)
+	}
+}
+
+// P1-3 (rs.go): the same true-duplicate rule in the salvage path. Under the
+// rsMaxTotalShards=64 cap no wire geometry can put a whole data shard in
+// padding (see TestRSSalvageFullRecoveryWhenLostShardsArePadding), so this
+// drives rsSalvage directly: one record per 4108-byte shard plus a lost
+// padding-only shard. Record 0 is a byte-identical duplicate of block 2's
+// record with only its CRC bytes smashed -> suppressed, full recovery, nil
+// error. The counter-case (same shape but the duplicate's DATA corrupted)
+// must stay a Truncated partial recovery — that was the old rule's silent
+// false-suppression window.
 func TestRSSalvageSupersededFullRecovery(t *testing.T) {
 	base := covBase(16)
 	dev := New(base)
-	for b := int64(1); b <= 8; b++ {
+	for b := int64(2); b <= 8; b++ {
 		if _, err := dev.WriteAt(covBlock(byte(0x60+b)), b*BlockSize); err != nil {
 			t.Fatal(err)
 		}
 	}
-	blob, err := dev.SerializeRS(254, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	shardSize := int(binary.LittleEndian.Uint32(blob[headerSize+4 : headerSize+8]))
-	// Record 0 (block 1) starts at payload offset 0 = shard 0 offset 0.
-	_, data := covRSShard(blob, shardSize, 0)
-	binary.LittleEndian.PutUint64(data[0:8], 2) // record CRC now fails; index reads 2
-	covFixShardCRC(blob, shardSize, 0)
-	covKillShard(t, blob, shardSize, 253) // padding-only data shard
-	covKillShard(t, blob, shardSize, 254) // parity
-	covKillShard(t, blob, shardSize, 255) // parity: missing=3 > K=2 -> salvage
+	payload := covL1Payload(t, dev) // 7 records: blocks 2..8
+	// Prepend a duplicate of block 2's record (payload[0:4108]) -> 8 records.
+	dup := bytes.Clone(payload[:l1RecordSize])
+	full := append(dup, payload...)
 
-	got, err := Deserialize(blob, base)
-	if err != nil {
-		t.Fatalf("skipped record superseded by applied block 2: err = %v, want nil", err)
+	run := func(t *testing.T, corrupt func(rec []byte)) (*Device, error) {
+		p := bytes.Clone(full)
+		corrupt(p[:l1RecordSize])
+		shards := covPayloadShards(p, 9, l1RecordSize)
+		shards[8] = nil // lost padding-only shard
+		return rsSalvage(shards, 9, l1RecordSize, len(p), base)
 	}
-	expectBlock(t, got, base, 1, nil)        // corrupt record's block degrades to base
-	expectBlock(t, got, base, 2, fill(0x62)) // intact duplicate target applied
+
+	t.Run("bit-identical duplicate: nil error", func(t *testing.T) {
+		got, err := run(t, func(rec []byte) { rec[l1RecordSize-1] ^= 0xFF })
+		if err != nil {
+			t.Fatalf("CRC-only damage on a true duplicate: err = %v, want nil", err)
+		}
+		expectBlock(t, got, base, 2, fill(0x62))
+		expectBlock(t, got, base, 8, fill(0x68))
+	})
+
+	t.Run("data-corrupt duplicate: Truncated", func(t *testing.T) {
+		got, err := run(t, func(rec []byte) { rec[8] ^= 0xFF })
+		var pre *PartialRecoveryError
+		if !errors.As(err, &pre) {
+			t.Fatalf("err = %v, want *PartialRecoveryError", err)
+		}
+		if len(pre.BadBlocks) != 0 || !pre.Truncated {
+			t.Fatalf("got BadBlocks=%v Truncated=%v, want none/true", pre.BadBlocks, pre.Truncated)
+		}
+		expectBlock(t, got, base, 2, fill(0x62)) // intact copy still applied
+	})
 }
 
 // P1-4: Inspect must mirror Deserialize's loss classes.

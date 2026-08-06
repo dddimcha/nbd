@@ -1,6 +1,7 @@
 package blockdevice
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -61,13 +62,19 @@ type PartialRecoveryError struct {
 	// index: a record whose CRC failed (index unverifiable), a cut-off tail
 	// whose index bytes are unreadable, surplus bytes beyond the header's
 	// blockCount, an unverifiable header, or shard regions lost beyond
-	// repair. As a heuristic, a CRC-failed record whose (unverified) index
-	// bytes name a block that another, intact record successfully applied is
-	// treated as superseded and reported as no loss at all — the index is
-	// unverified, so this suppression happens ONLY when the read index
-	// matches an applied block; in every other case Truncated is set. Every
-	// non-nil PartialRecoveryError has at least one BadBlocks entry or
-	// Truncated set (or both).
+	// repair. One narrow exception: a CRC-failed record is suppressed as a
+	// harmless true duplicate when its data bytes are BIT-IDENTICAL to the
+	// data of the record that was applied for its (unverified) read index —
+	// the canonical case being a genuine duplicate record whose corruption
+	// hit its index or CRC bytes while the identical content survived via
+	// the intact copy. The residual window is stated honestly: false
+	// suppression now requires a CRC-failed record whose full data bytes
+	// exactly equal the applied record's data under the misread index — a
+	// mere index-byte flip no longer suffices, since two distinct blocks
+	// would additionally have to carry byte-identical content for the loss
+	// to go unreported. In every other case Truncated is set. Every non-nil
+	// PartialRecoveryError has at least one BadBlocks entry or Truncated
+	// set (or both).
 	Truncated bool
 }
 
@@ -75,6 +82,13 @@ type PartialRecoveryError struct {
 func (e *PartialRecoveryError) Error() string {
 	return fmt.Sprintf("blockdevice: partial recovery, %d bad block(s): %v (truncated: %v)",
 		len(e.BadBlocks), e.BadBlocks, e.Truncated)
+}
+
+// skippedRec remembers a CRC-failed record's unverified read index and data
+// bytes for the true-duplicate suppression check (see PartialRecoveryError).
+type skippedRec struct {
+	idx  int64
+	data []byte
 }
 
 // finalizeBad post-processes a bad-block list: entries whose block was in the
@@ -259,9 +273,9 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 
 	dev := New(base)
 	maxBlock := int64(len(base) / BlockSize)
-	var bad []int64       // structurally lost blocks with a readable, in-range index
-	var skipped []int64   // read-but-UNVERIFIED indices of CRC-failed records
-	unattributed := false // loss with no trustworthy block index
+	var bad []int64          // structurally lost blocks with a readable, in-range index
+	var skipped []skippedRec // read-but-UNVERIFIED index+data of CRC-failed records
+	unattributed := false    // loss with no trustworthy block index
 	tailIdx, tailNamed := int64(0), false
 
 	// The header CRC covers layout, not content, so blockCount is an upper
@@ -317,8 +331,9 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 			if crc32.ChecksumIEEE(rec[:8+BlockSize]) != want {
 				// The CRC covers index+data, so the index is unverified —
 				// do NOT blame the block it names. Remember the read index
-				// only for the superseded-duplicate heuristic below.
-				skipped = append(skipped, idx)
+				// and data (rec aliases body, which is stable here) only
+				// for the true-duplicate suppression check below.
+				skipped = append(skipped, skippedRec{idx: idx, data: rec[8 : 8+BlockSize]})
 				continue
 			}
 		}
@@ -331,13 +346,13 @@ func applyRecords(body []byte, tier Tier, blockCount uint64, base []byte) (*Devi
 		dev.dirty[idx] = b
 	}
 
-	// Superseded-duplicate heuristic (see PartialRecoveryError doc): a
-	// CRC-failed record whose read index names a block another record
-	// successfully applied is counted as no loss; any other skip is
-	// unattributable loss.
+	// True-duplicate suppression (see PartialRecoveryError doc): a
+	// CRC-failed record is counted as no loss ONLY when its data bytes are
+	// bit-identical to the record actually applied for its read index; any
+	// other skip is unattributable loss.
 	for _, s := range skipped {
-		if s >= 0 && s < maxBlock {
-			if _, applied := dev.dirty[s]; applied {
+		if s.idx >= 0 && s.idx < maxBlock {
+			if applied, ok := dev.dirty[s.idx]; ok && bytes.Equal(applied, s.data) {
 				continue
 			}
 		}

@@ -26,6 +26,7 @@ package blockdevice
 // stream.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -38,18 +39,26 @@ import (
 const (
 	rsMetaSize      = 2 + 2 + 4 + 8 + 4 // N | K | shardSize | payloadLen | crc32
 	rsShardHdrSize  = 2 + 4             // shardIndex | crc32(shard data)
-	rsMaxShards     = 256               // classic Reed-Solomon limit
 	rsDefaultData   = 10
 	rsDefaultParity = 2
+	// rsMaxTotalShards is the absolute cap on data+parity shards.
+	// reedsolomon.New does O(total^3) matrix setup regardless of payload
+	// size, so the shard count itself — not the payload — is the CPU
+	// multiplier: 254+2 shards cost tens of milliseconds per decode even
+	// when the payload "justifies" them (a 33 KB payload clears the
+	// 128-bytes-per-shard rule at N=254). Capping total at 64 bounds the
+	// matrix work at sub-millisecond worst case; all default geometries
+	// (rsDefaultData=10, +2 parity) fit with wide margin. Enforced
+	// identically on encode (SerializeRS) and decode (parseRSMeta). See
+	// DESIGN.md ("Shard geometry bounds").
+	rsMaxTotalShards = 64
 	// rsMinShardPayload is the minimum average payload bytes each data shard
 	// must be justified by: geometries with dataShards >
 	// max(1, ceil(payloadLen/rsMinShardPayload)) are rejected on both the
-	// encode and decode side. reedsolomon.New does O(shards^3)-ish matrix
-	// work regardless of payload size, so without this bound a tiny
-	// (~6 KB) blob claiming 254+2 shards costs tens of milliseconds to
-	// reject — an unbounded CPU multiplier on untrusted input. With it, the
-	// matrix cost is proportional to the payload the caller already paid to
-	// read. See DESIGN.md ("Shard geometry bounds").
+	// encode and decode side. This is a secondary tightening on top of the
+	// rsMaxTotalShards cap: it keeps tiny payloads from being sliced into
+	// useless slivers and ties shard count to bytes the caller already paid
+	// to read.
 	rsMinShardPayload = 128
 	// rsMaxDecodeAlloc bounds total shard memory a decoded rsMeta may demand,
 	// so a forged-but-CRC-valid rsMeta cannot force a huge allocation.
@@ -62,8 +71,8 @@ const (
 //	dataShards   <= max(1, ceil(payloadLen/rsMinShardPayload))
 //	parityShards <= max(rsDefaultParity, dataShards)
 //
-// (the dataShards >= 1, parityShards >= 0 and total <= rsMaxShards checks
-// live at the call sites, which report them separately). SerializeRS and
+// (the dataShards >= 1, parityShards >= 0 and total <= rsMaxTotalShards
+// checks live at the call sites, which report them separately). SerializeRS and
 // parseRSMeta apply the same predicate, so every blob SerializeRS can produce
 // is one Deserialize/Inspect accepts, and vice versa.
 func validRSGeometry(dataShards, parityShards int, payloadLen uint64) bool {
@@ -111,9 +120,9 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 			parityShards = dp
 		}
 	}
-	if dataShards+parityShards > rsMaxShards {
+	if dataShards+parityShards > rsMaxTotalShards {
 		return nil, fmt.Errorf("blockdevice: %d shards exceeds max %d: %w",
-			dataShards+parityShards, rsMaxShards, ErrUnsupportedTier)
+			dataShards+parityShards, rsMaxTotalShards, ErrUnsupportedTier)
 	}
 	if !validRSGeometry(dataShards, parityShards, uint64(payloadLen)) {
 		// The decoder (parseRSMeta) rejects payload-unjustified geometries,
@@ -281,14 +290,16 @@ func parseRSMeta(body []byte, blockCount uint64) (rsGeometry, error) {
 	payloadLen64 := binary.LittleEndian.Uint64(meta[8:16])
 	total := g.dataShards + g.parityShards
 
-	if g.dataShards < 1 || g.parityShards < 0 || total > rsMaxShards {
+	// The absolute total cap and the payload-justification rule below are
+	// both enforced BEFORE any allocation or Reed-Solomon matrix work:
+	// reedsolomon.New is O(total^3) regardless of payload size, so a
+	// hostile-but-CRC-valid rsMeta claiming e.g. 254+2 shards would
+	// otherwise cost tens of milliseconds per blob — even with a payload
+	// large enough to "justify" the count. Same predicates as the encode
+	// side.
+	if g.dataShards < 1 || g.parityShards < 0 || total > rsMaxTotalShards {
 		return g, fmt.Errorf("blockdevice: invalid shard geometry %d+%d: %w", g.dataShards, g.parityShards, ErrCorrupt)
 	}
-	// Reject geometries the payload does not justify BEFORE any allocation or
-	// Reed-Solomon matrix work: reedsolomon.New is O(shards^3)-ish regardless
-	// of payload size, so a hostile-but-CRC-valid rsMeta claiming e.g. 254+2
-	// shards over a single-record payload would otherwise cost tens of
-	// milliseconds per blob. Same predicate as the encode side.
 	if !validRSGeometry(g.dataShards, g.parityShards, payloadLen64) {
 		return g, fmt.Errorf("blockdevice: shard geometry %d+%d not justified by payload %d: %w",
 			g.dataShards, g.parityShards, payloadLen64, ErrCorrupt)
@@ -420,9 +431,9 @@ func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []by
 
 	dev := New(base)
 	maxBlock := int64(len(base) / BlockSize)
-	var bad []int64       // lost-shard records with a readable, in-range index
-	var skipped []int64   // read-but-UNVERIFIED indices of CRC-failed records
-	var lostNamed []int64 // indices of records overlapping lost shards
+	var bad []int64          // lost-shard records with a readable, in-range index
+	var skipped []skippedRec // read-but-UNVERIFIED index+data of CRC-failed records
+	var lostNamed []int64    // indices of records overlapping lost shards
 	unattributed := false
 	rec := make([]byte, l1RecordSize)
 	for lo := 0; lo+l1RecordSize <= payloadLen; lo += l1RecordSize {
@@ -433,8 +444,9 @@ func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []by
 			case crc32.ChecksumIEEE(rec[:8+BlockSize]) != want:
 				// CRC covers index+data: the index is unverified, so no
 				// block is blamed (see PartialRecoveryError). Keep the read
-				// index for the superseded-duplicate heuristic.
-				skipped = append(skipped, idx)
+				// index and a copy of the data (rec is reused) for the
+				// true-duplicate suppression check below.
+				skipped = append(skipped, skippedRec{idx: idx, data: bytes.Clone(rec[8 : 8+BlockSize])})
 			case idx >= 0 && idx < maxBlock:
 				b := make([]byte, BlockSize)
 				copy(b, rec[8:8+BlockSize])
@@ -457,12 +469,13 @@ func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []by
 		unattributed = true
 	}
 
-	// Superseded-duplicate heuristic, mirroring applyRecords: a CRC-failed
-	// record whose read index names an applied block is no loss; anything
-	// else is unattributable.
+	// True-duplicate suppression, mirroring applyRecords: a CRC-failed
+	// record is no loss ONLY when its data bytes are bit-identical to the
+	// applied record for its read index (see PartialRecoveryError for the
+	// residual window); anything else is unattributable loss.
 	for _, s := range skipped {
-		if s >= 0 && s < maxBlock {
-			if _, applied := dev.dirty[s]; applied {
+		if s.idx >= 0 && s.idx < maxBlock {
+			if applied, ok := dev.dirty[s.idx]; ok && bytes.Equal(applied, s.data) {
 				continue
 			}
 		}
@@ -478,8 +491,8 @@ func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []by
 	bad = finalizeBad(dev, bad)
 	if len(bad) == 0 && !unattributed {
 		// Every record decoded — the lost shards were all parity (or
-		// padding), or every skipped record was superseded by an intact
-		// duplicate. Full recovery.
+		// padding), or every skipped record was a bit-identical duplicate
+		// of an applied one. Full recovery.
 		return dev, nil
 	}
 	return dev, &PartialRecoveryError{BadBlocks: bad, Truncated: unattributed}

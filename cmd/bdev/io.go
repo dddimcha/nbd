@@ -55,12 +55,16 @@ func parseArgs(fs *flag.FlagSet, args []string, want int, synopsis string, stdou
 			flags = append(flags, args[i])
 		}
 	}
+	// Silence the FlagSet's own output: on -h it would print its generated
+	// usage (flag table) in addition to our synopsis, and on a bad flag it
+	// prints the error itself — both are reported here instead, exactly once.
+	fs.SetOutput(io.Discard)
 	if err := fs.Parse(flags); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(stdout, synopsis)
 			return nil, 0
 		}
-		return nil, 2
+		return nil, fail(stderr, 2, "%v\n%s", err, synopsis)
 	}
 	if len(pos) > want {
 		return nil, fail(stderr, 2, "unexpected argument(s) %q\n%s", pos[want:], synopsis)
@@ -93,10 +97,17 @@ func loadImage(path string) ([]byte, error) {
 func loadBlob(path string) ([]byte, error) { return os.ReadFile(path) }
 
 // writeFile writes data to path with mode 0644, atomically: the bytes go to
-// a temp file in the target's directory which is renamed into place, so a
-// failed write (ENOSPC, crash) never leaves a truncated file clobbering a
-// good previous one.
+// a temp file in the target's directory, fsynced and then renamed into
+// place, so a failed write (ENOSPC, crash) never leaves a truncated file
+// clobbering a good previous one. If the target already exists and is (or
+// traverses) a symlink, it is resolved first and the write goes through to
+// the real file, instead of the rename silently replacing the symlink with
+// a regular file; a target that does not resolve (missing, dangling link)
+// is written at the literal path.
 func writeFile(path string, data []byte) error {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err
@@ -107,6 +118,10 @@ func writeFile(path string, data []byte) error {
 		return err
 	}
 	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}

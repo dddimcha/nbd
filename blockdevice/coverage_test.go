@@ -86,8 +86,9 @@ func TestPartialRecoveryErrorString(t *testing.T) {
 	}
 }
 
-// finalizeBad dedup branch (format.go:76-77): two corrupt L1 records naming
-// the SAME block index must yield one BadBlocks entry.
+// Two corrupt L1 records naming the SAME block index: neither index is
+// verifiable (the CRC covers index+data), so the loss is unattributed and no
+// block is blamed.
 func TestL1DuplicateBadIndexDeduped(t *testing.T) {
 	base := covBase(4)
 	dev := New(base)
@@ -112,8 +113,8 @@ func TestL1DuplicateBadIndexDeduped(t *testing.T) {
 	if !errors.As(err, &pre) {
 		t.Fatalf("want *PartialRecoveryError, got %v", err)
 	}
-	if len(pre.BadBlocks) != 1 || pre.BadBlocks[0] != 0 {
-		t.Fatalf("BadBlocks = %v, want [0] (deduplicated)", pre.BadBlocks)
+	if len(pre.BadBlocks) != 0 || !pre.Truncated {
+		t.Fatalf("got BadBlocks=%v Truncated=%v, want none/true (CRC-failed indices are untrusted)", pre.BadBlocks, pre.Truncated)
 	}
 	got := make([]byte, BlockSize)
 	if _, err := dev2.ReadAt(got, 0); err != nil {
@@ -242,16 +243,16 @@ func TestHeaderlessFallbackEdges(t *testing.T) {
 		}
 	})
 
-	t.Run("bad record with in-range index is named", func(t *testing.T) {
+	t.Run("bad record is unattributed, survivor applied", func(t *testing.T) {
 		blob := mk(1, 3)
-		blob[headerSize+8] ^= 0xFF // corrupt record 0 data; its index (1) stays readable
+		blob[headerSize+8] ^= 0xFF // corrupt record 0 data; its index is now untrusted
 		dev2, err := Deserialize(blob, base)
 		var pre *PartialRecoveryError
 		if !errors.As(err, &pre) {
 			t.Fatalf("want *PartialRecoveryError, got %v", err)
 		}
-		if len(pre.BadBlocks) != 1 || pre.BadBlocks[0] != 1 || !pre.Truncated {
-			t.Fatalf("got BadBlocks=%v Truncated=%v, want [1]/true", pre.BadBlocks, pre.Truncated)
+		if len(pre.BadBlocks) != 0 || !pre.Truncated {
+			t.Fatalf("got BadBlocks=%v Truncated=%v, want none/true (CRC-failed index untrusted)", pre.BadBlocks, pre.Truncated)
 		}
 		got := make([]byte, BlockSize)
 		if _, err := dev2.ReadAt(got, 3*BlockSize); err != nil {
@@ -347,22 +348,25 @@ func TestRSForgedMetaRejected(t *testing.T) {
 	}
 }
 
-// Salvage full-recovery path (rs.go:313-317): with 254 data shards over one
-// 4108-byte record, shardSize is 17 and the last data shard is pure padding.
-// Losing it plus both parity shards exceeds K, forcing salvage — but every
-// record still decodes, so recovery is complete and err must be nil.
+// Salvage full-recovery path: with 254 data shards over eight 4108-byte
+// records (payload 32864, within the geometry bound dataShards <=
+// ceil(payloadLen/128)), shardSize is 130 and the last data shard is pure
+// padding. Losing it plus both parity shards exceeds K, forcing salvage — but
+// every record still decodes, so recovery is complete and err must be nil.
 func TestRSSalvageFullRecoveryWhenLostShardsArePadding(t *testing.T) {
-	base := covBase(2)
+	base := covBase(16)
 	dev := New(base)
-	if _, err := dev.WriteAt(covBlock(0x66), BlockSize); err != nil {
-		t.Fatal(err)
+	for b := int64(1); b <= 8; b++ {
+		if _, err := dev.WriteAt(covBlock(byte(0x60+b)), b*BlockSize); err != nil {
+			t.Fatal(err)
+		}
 	}
 	blob, err := dev.SerializeRS(254, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	shardSize := int(binary.LittleEndian.Uint32(blob[headerSize+4 : headerSize+8]))
-	if 253*shardSize < l1RecordSize {
+	if 253*shardSize < 8*l1RecordSize {
 		t.Fatalf("test premise broken: last data shard carries payload (shardSize=%d)", shardSize)
 	}
 	covKillShard(t, blob, shardSize, 253) // padding-only data shard
@@ -373,11 +377,13 @@ func TestRSSalvageFullRecoveryWhenLostShardsArePadding(t *testing.T) {
 		t.Fatalf("want full recovery, got %v", err)
 	}
 	got := make([]byte, BlockSize)
-	if _, err := dev2.ReadAt(got, BlockSize); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, covBlock(0x66)) {
-		t.Error("block 1 not recovered")
+	for b := int64(1); b <= 8; b++ {
+		if _, err := dev2.ReadAt(got, b*BlockSize); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, covBlock(byte(0x60+b))) {
+			t.Errorf("block %d not recovered", b)
+		}
 	}
 }
 
@@ -407,10 +413,10 @@ func TestRSSalvageUnattributableLoss(t *testing.T) {
 	}
 }
 
-// Salvage over intact shards whose record content is bad (rs.go:293-297):
-// the shard CRC is refreshed after the edit, so the shard reads as intact and
-// the RECORD check must catch it — naming the block when the index survives,
-// or counting unattributable loss when the index itself was smashed.
+// Salvage over intact shards whose record content is bad: the shard CRC is
+// refreshed after the edit, so the shard reads as intact and the RECORD check
+// must catch it — a failed record CRC means the index is untrusted, so the
+// loss is unattributed either way (index plausible or smashed).
 func TestRSSalvageBadRecordInIntactShard(t *testing.T) {
 	base := covBase(4)
 	mkBlob := func() ([]byte, int) {
@@ -432,10 +438,10 @@ func TestRSSalvageBadRecordInIntactShard(t *testing.T) {
 		return blob, shardSize
 	}
 
-	t.Run("index readable: block named", func(t *testing.T) {
+	t.Run("index readable but unverified: unattributed", func(t *testing.T) {
 		blob, shardSize := mkBlob()
 		_, data := covRSShard(blob, shardSize, 0)
-		data[8] ^= 0xFF // corrupt record payload, keep index bytes
+		data[8] ^= 0xFF // corrupt record payload; index bytes untouched but now untrusted
 		covFixShardCRC(blob, shardSize, 0)
 		covKillShard(t, blob, shardSize, 1) // lose shard 1
 		covKillShard(t, blob, shardSize, 2) // lose parity: missing=2 > K=1 -> salvage
@@ -444,8 +450,8 @@ func TestRSSalvageBadRecordInIntactShard(t *testing.T) {
 		if !errors.As(err, &pre) {
 			t.Fatalf("want *PartialRecoveryError, got %v", err)
 		}
-		if len(pre.BadBlocks) != 1 || pre.BadBlocks[0] != 0 || !pre.Truncated {
-			t.Fatalf("got BadBlocks=%v Truncated=%v, want [0]/true", pre.BadBlocks, pre.Truncated)
+		if len(pre.BadBlocks) != 0 || !pre.Truncated {
+			t.Fatalf("got BadBlocks=%v Truncated=%v, want none/true (CRC-failed index untrusted)", pre.BadBlocks, pre.Truncated)
 		}
 	})
 

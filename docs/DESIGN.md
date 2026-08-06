@@ -60,6 +60,25 @@ default and integrity is opt-in via the header tier byte.
   dirty block is 1+2 shards, i.e. ~200% overhead (plus the 6-byte shard
   headers and 20-byte rsMeta). L2 only pays off for deltas of several blocks.
 
+### Shard geometry bounds
+
+`reedsolomon.New` does O(shards³)-ish matrix setup regardless of payload
+size, so shard counts must be justified by the payload or a tiny hostile blob
+becomes a CPU multiplier (a ~6 KB blob claiming 254+2 shards cost tens of
+milliseconds to reject, pre-bound). Both `SerializeRS` (encode) and
+`parseRSMeta` (decode — so `Deserialize` and `Inspect` alike) enforce the
+same rule, keeping every encodable blob decodable:
+
+```
+dataShards   >= 1
+dataShards   <= max(1, ceil(payloadLen/128))   // >=128 payload bytes per data shard
+parityShards <= max(2, dataShards)
+dataShards + parityShards <= 256               // classic RS limit
+```
+
+Violations are `ErrUnsupportedTier` on encode and `ErrCorrupt` on decode,
+raised before any allocation or matrix work.
+
 Word-wise Hamming SECDED was considered as a zero-dependency middle tier and
 rejected: at 12.5% overhead it only repairs scattered bit flips, while the
 realistic failure classes for a serialized delta (truncation, lost ranges) need

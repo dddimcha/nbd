@@ -41,10 +41,42 @@ const (
 	rsMaxShards     = 256               // classic Reed-Solomon limit
 	rsDefaultData   = 10
 	rsDefaultParity = 2
+	// rsMinShardPayload is the minimum average payload bytes each data shard
+	// must be justified by: geometries with dataShards >
+	// max(1, ceil(payloadLen/rsMinShardPayload)) are rejected on both the
+	// encode and decode side. reedsolomon.New does O(shards^3)-ish matrix
+	// work regardless of payload size, so without this bound a tiny
+	// (~6 KB) blob claiming 254+2 shards costs tens of milliseconds to
+	// reject — an unbounded CPU multiplier on untrusted input. With it, the
+	// matrix cost is proportional to the payload the caller already paid to
+	// read. See DESIGN.md ("Shard geometry bounds").
+	rsMinShardPayload = 128
 	// rsMaxDecodeAlloc bounds total shard memory a decoded rsMeta may demand,
 	// so a forged-but-CRC-valid rsMeta cannot force a huge allocation.
 	rsMaxDecodeAlloc = 1 << 33
 )
+
+// validRSGeometry reports whether a shard geometry is acceptable for a
+// payload of the given size. The rule (documented in DESIGN.md):
+//
+//	dataShards   <= max(1, ceil(payloadLen/rsMinShardPayload))
+//	parityShards <= max(rsDefaultParity, dataShards)
+//
+// (the dataShards >= 1, parityShards >= 0 and total <= rsMaxShards checks
+// live at the call sites, which report them separately). SerializeRS and
+// parseRSMeta apply the same predicate, so every blob SerializeRS can produce
+// is one Deserialize/Inspect accepts, and vice versa.
+func validRSGeometry(dataShards, parityShards int, payloadLen uint64) bool {
+	maxData := (payloadLen + rsMinShardPayload - 1) / rsMinShardPayload
+	if maxData < 1 {
+		maxData = 1
+	}
+	maxParity := dataShards
+	if maxParity < rsDefaultParity {
+		maxParity = rsDefaultParity
+	}
+	return uint64(dataShards) <= maxData && parityShards <= maxParity
+}
 
 // rsDefaultShards returns the default shard geometry for a payload of the
 // given size. Parity is fixed at rsDefaultParity; the data shard count scales
@@ -82,6 +114,13 @@ func (d *Device) SerializeRS(dataShards, parityShards int) ([]byte, error) {
 	if dataShards+parityShards > rsMaxShards {
 		return nil, fmt.Errorf("blockdevice: %d shards exceeds max %d: %w",
 			dataShards+parityShards, rsMaxShards, ErrUnsupportedTier)
+	}
+	if !validRSGeometry(dataShards, parityShards, uint64(payloadLen)) {
+		// The decoder (parseRSMeta) rejects payload-unjustified geometries,
+		// so refusing to serialize them keeps every SerializeRS output
+		// deserializable.
+		return nil, fmt.Errorf("blockdevice: shard geometry %d+%d not justified by payload %d (see DESIGN.md): %w",
+			dataShards, parityShards, payloadLen, ErrUnsupportedTier)
 	}
 
 	shardSize := 0
@@ -245,6 +284,15 @@ func parseRSMeta(body []byte, blockCount uint64) (rsGeometry, error) {
 	if g.dataShards < 1 || g.parityShards < 0 || total > rsMaxShards {
 		return g, fmt.Errorf("blockdevice: invalid shard geometry %d+%d: %w", g.dataShards, g.parityShards, ErrCorrupt)
 	}
+	// Reject geometries the payload does not justify BEFORE any allocation or
+	// Reed-Solomon matrix work: reedsolomon.New is O(shards^3)-ish regardless
+	// of payload size, so a hostile-but-CRC-valid rsMeta claiming e.g. 254+2
+	// shards over a single-record payload would otherwise cost tens of
+	// milliseconds per blob. Same predicate as the encode side.
+	if !validRSGeometry(g.dataShards, g.parityShards, payloadLen64) {
+		return g, fmt.Errorf("blockdevice: shard geometry %d+%d not justified by payload %d: %w",
+			g.dataShards, g.parityShards, payloadLen64, ErrCorrupt)
+	}
 	// A CRC-valid rsMeta is not a trustworthy rsMeta (CRC32 is not
 	// authentication), so its fields must also be internally consistent and
 	// consistent with the bytes actually present:
@@ -372,20 +420,26 @@ func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []by
 
 	dev := New(base)
 	maxBlock := int64(len(base) / BlockSize)
-	var bad []int64
+	var bad []int64       // lost-shard records with a readable, in-range index
+	var skipped []int64   // read-but-UNVERIFIED indices of CRC-failed records
+	var lostNamed []int64 // indices of records overlapping lost shards
 	unattributed := false
 	rec := make([]byte, l1RecordSize)
 	for lo := 0; lo+l1RecordSize <= payloadLen; lo += l1RecordSize {
 		if readSpan(rec, lo) {
 			idx := int64(binary.LittleEndian.Uint64(rec[0:8]))
 			want := binary.LittleEndian.Uint32(rec[8+BlockSize : l1RecordSize])
-			if crc32.ChecksumIEEE(rec[:8+BlockSize]) == want && idx >= 0 && idx < maxBlock {
+			switch {
+			case crc32.ChecksumIEEE(rec[:8+BlockSize]) != want:
+				// CRC covers index+data: the index is unverified, so no
+				// block is blamed (see PartialRecoveryError). Keep the read
+				// index for the superseded-duplicate heuristic.
+				skipped = append(skipped, idx)
+			case idx >= 0 && idx < maxBlock:
 				b := make([]byte, BlockSize)
 				copy(b, rec[8:8+BlockSize])
 				dev.dirty[idx] = b
-			} else if idx >= 0 && idx < maxBlock {
-				bad = append(bad, idx)
-			} else {
+			default:
 				unattributed = true
 			}
 			continue
@@ -396,20 +450,37 @@ func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []by
 		if readSpan(idxBuf[:], lo) {
 			if idx := int64(binary.LittleEndian.Uint64(idxBuf[:])); idx >= 0 && idx < maxBlock {
 				bad = append(bad, idx)
+				lostNamed = append(lostNamed, idx)
 				continue
 			}
 		}
 		unattributed = true
 	}
 
+	// Superseded-duplicate heuristic, mirroring applyRecords: a CRC-failed
+	// record whose read index names an applied block is no loss; anything
+	// else is unattributable.
+	for _, s := range skipped {
+		if s >= 0 && s < maxBlock {
+			if _, applied := dev.dirty[s]; applied {
+				continue
+			}
+		}
+		unattributed = true
+	}
+	// A record lost to a dead shard is structural loss even when its named
+	// block was applied by a duplicate record: that copy's content is gone.
+	for _, s := range lostNamed {
+		if _, applied := dev.dirty[s]; applied {
+			unattributed = true
+		}
+	}
 	bad = finalizeBad(dev, bad)
 	if len(bad) == 0 && !unattributed {
 		// Every record decoded — the lost shards were all parity (or
-		// padding). Full recovery.
+		// padding), or every skipped record was superseded by an intact
+		// duplicate. Full recovery.
 		return dev, nil
-	}
-	if len(bad) == 0 {
-		unattributed = true
 	}
 	return dev, &PartialRecoveryError{BadBlocks: bad, Truncated: unattributed}
 }

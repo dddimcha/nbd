@@ -1,4 +1,4 @@
-module github.com/dddimcha/blockdevice
+module github.com/dddimcha/nbd
 
 go 1.25
 

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	blockdevice "github.com/dddimcha/blockdevice"
+	blockdevice "github.com/dddimcha/nbd"
 )
 
 // ExampleNew shows the basic copy-on-write cycle: create a device over an

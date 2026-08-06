@@ -37,7 +37,9 @@ trade-offs.
 
 ```
 blockdevice/        the Go package (core, wire format, RS tier, tests)
-docs/               DESIGN.md — formats, trade-offs, concurrency contract
+cmd/bdev/           bdev CLI: diff / apply / inspect
+docs/               DESIGN.md — formats, trade-offs, concurrency contract;
+                    ARCHITECTURE.md — layers, data flow, extension points
 scripts/            gates.sh — quality-gate runner
 build/              Dockerfile — reproducible build & test stages
 .github/workflows/  CI: fmt, vet, race tests, fuzz + bench smoke

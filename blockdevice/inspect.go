@@ -31,7 +31,8 @@ type Info struct {
 	// index field survived. Sorted ascending and deduplicated; real record
 	// indices only — never a sentinel. Inspect has no base, so entries may
 	// lie outside any particular base's range (including negative values).
-	// Always nil for L0 (no per-record CRC).
+	// For L0 (no per-record CRC) the only possible entry is the index of a
+	// record cut off by truncation, and it is unverified raw bytes.
 	BadBlocks []int64
 	// UnattributedLoss counts records that are lost or unverifiable without
 	// a readable index: L1/L2 records whose CRC failed (the CRC covers

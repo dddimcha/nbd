@@ -51,7 +51,7 @@ default and integrity is opt-in via the header tier byte.
   `Reconstruct` recovers up to K fully lost or corrupt shards, then the result
   decodes as ordinary L1. This is the MinIO/RAID model in miniature: it
   survives bit rot, truncation and torn ranges alike. The only external
-  dependency, isolated in its own file behind the tier switch.
+  dependency, confined to rs.go and inspect.go behind the tier switch.
 
   Default geometry scales with the delta: N = min(10, max(1, payloadLen/4096))
   data shards, K = 2 parity shards. Ten or more dirty blocks get the full
@@ -82,8 +82,8 @@ raised before any allocation or matrix work.
 Word-wise Hamming SECDED was considered as a zero-dependency middle tier and
 rejected: at 12.5% overhead it only repairs scattered bit flips, while the
 realistic failure classes for a serialized delta (truncation, lost ranges) need
-erasure coding anyway. RS at 10+2 costs 20% but recovers the loss of 20% of
-the blob outright.
+erasure coding anyway. RS at 10+2 costs 20% but recovers the outright loss of
+any 2 of the 12 shards — 16.7% of the blob.
 
 ## Why not one tier
 

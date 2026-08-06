@@ -29,8 +29,9 @@ dev2, _ := blockdevice.Deserialize(blob, base)
 | L2 | Reed–Solomon: reconstructs up to K lost/corrupt shards | K/N of the blob |
 
 Every record carries its own block index, so a decoder survives reordering,
-gaps and truncation; a corrupt block degrades to the base content instead of
-failing the whole device. See [DESIGN.md](docs/DESIGN.md) for the exact formats and
+gaps and truncation; at L1/L2 a corrupt block degrades to the base content
+instead of failing the whole device (L0 has no per-record CRC, so corruption
+there is undetectable). See [DESIGN.md](docs/DESIGN.md) for the exact formats and
 trade-offs.
 
 ## Layout

@@ -12,7 +12,7 @@
         │  rs.go          — L2 tier: Reed-Solomon sharding over the L1 payload
         ▼
     github.com/klauspost/reedsolomon  (only external dependency, reached
-    only through rs.go behind the tier switch)
+    only through rs.go and inspect.go, behind the tier switch)
 
 The CLI never touches format internals: everything it prints comes from the
 exported API (`Inspect`, `Deserialize`, `SerializeTier`, typed errors).
@@ -32,8 +32,9 @@ The library is one cohesive concern — a copy-on-write overlay and its wire
 format — whose parts share unexported vocabulary (record layouts, tier
 constants, shard headers). Splitting format.go/rs.go into sub-packages would
 force exporting those internals or duplicating them; keeping one package keeps
-the format private, the API surface minimal (Device, Tier, Inspect, two
-errors), and the only external dependency quarantined in rs.go. The CLI needs
+the format private, the API surface minimal (Device, Tier, Inspect/Info, four
+sentinel errors plus PartialRecoveryError), and the only external dependency
+confined to rs.go and inspect.go. The CLI needs
 no `internal/` package: it is a single main package with no importable surface
 to protect.
 

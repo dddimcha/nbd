@@ -219,24 +219,31 @@ func writeEmptyShardHeaders(dst []byte, total int) {
 	}
 }
 
-// deserializeRS decodes the body of a TierL2 blob (rsMeta + shard section)
-// over base. Called from Deserialize after the outer header verified.
-func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error) {
+// rsGeometry is the validated content of an rsMeta section.
+type rsGeometry struct {
+	dataShards, parityShards, shardSize, payloadLen int
+}
+
+// parseRSMeta decodes and validates the rsMeta section at the front of a
+// TierL2 body against the outer header's blockCount. It returns ErrCorrupt
+// on any inconsistency; see the inline comments for the trust model.
+func parseRSMeta(body []byte, blockCount uint64) (rsGeometry, error) {
+	var g rsGeometry
 	if len(body) < rsMetaSize {
-		return nil, fmt.Errorf("blockdevice: body length %d shorter than rs meta %d: %w", len(body), rsMetaSize, ErrCorrupt)
+		return g, fmt.Errorf("blockdevice: body length %d shorter than rs meta %d: %w", len(body), rsMetaSize, ErrCorrupt)
 	}
 	meta := body[:rsMetaSize]
 	if crc32.ChecksumIEEE(meta[:16]) != binary.LittleEndian.Uint32(meta[16:20]) {
-		return nil, fmt.Errorf("blockdevice: rs meta CRC mismatch: %w", ErrCorrupt)
+		return g, fmt.Errorf("blockdevice: rs meta CRC mismatch: %w", ErrCorrupt)
 	}
-	dataShards := int(binary.LittleEndian.Uint16(meta[0:2]))
-	parityShards := int(binary.LittleEndian.Uint16(meta[2:4]))
-	shardSize := int(binary.LittleEndian.Uint32(meta[4:8]))
+	g.dataShards = int(binary.LittleEndian.Uint16(meta[0:2]))
+	g.parityShards = int(binary.LittleEndian.Uint16(meta[2:4]))
+	g.shardSize = int(binary.LittleEndian.Uint32(meta[4:8]))
 	payloadLen64 := binary.LittleEndian.Uint64(meta[8:16])
-	total := dataShards + parityShards
+	total := g.dataShards + g.parityShards
 
-	if dataShards < 1 || parityShards < 0 || total > rsMaxShards {
-		return nil, fmt.Errorf("blockdevice: invalid shard geometry %d+%d: %w", dataShards, parityShards, ErrCorrupt)
+	if g.dataShards < 1 || g.parityShards < 0 || total > rsMaxShards {
+		return g, fmt.Errorf("blockdevice: invalid shard geometry %d+%d: %w", g.dataShards, g.parityShards, ErrCorrupt)
 	}
 	// A CRC-valid rsMeta is not a trustworthy rsMeta (CRC32 is not
 	// authentication), so its fields must also be internally consistent and
@@ -249,33 +256,36 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 	//     to ~75% of the blob; rsMaxDecodeAlloc stays as an absolute cap.
 	if payloadLen64%uint64(l1RecordSize) != 0 ||
 		payloadLen64/uint64(l1RecordSize) != blockCount {
-		return nil, fmt.Errorf("blockdevice: rs payload length %d inconsistent with block count %d: %w", payloadLen64, blockCount, ErrCorrupt)
+		return g, fmt.Errorf("blockdevice: rs payload length %d inconsistent with block count %d: %w", payloadLen64, blockCount, ErrCorrupt)
 	}
-	if uint64(total)*uint64(shardSize) > rsMaxDecodeAlloc ||
-		payloadLen64 > uint64(dataShards)*uint64(shardSize) {
-		return nil, fmt.Errorf("blockdevice: rs shard geometry demands excessive or insufficient allocation: %w", ErrCorrupt)
+	if uint64(total)*uint64(g.shardSize) > rsMaxDecodeAlloc ||
+		payloadLen64 > uint64(g.dataShards)*uint64(g.shardSize) {
+		return g, fmt.Errorf("blockdevice: rs shard geometry demands excessive or insufficient allocation: %w", ErrCorrupt)
 	}
-	payloadLen := int(payloadLen64)
+	g.payloadLen = int(payloadLen64)
 
-	if payloadLen == 0 {
-		return applyRecords(nil, TierL1, blockCount, base)
+	if g.payloadLen == 0 {
+		return g, nil
 	}
-	if shardSize == 0 {
-		return nil, fmt.Errorf("blockdevice: zero shard size with non-empty payload %d: %w", payloadLen, ErrCorrupt)
+	if g.shardSize == 0 {
+		return g, fmt.Errorf("blockdevice: zero shard size with non-empty payload %d: %w", g.payloadLen, ErrCorrupt)
 	}
-	if shardSize != (payloadLen+dataShards-1)/dataShards {
-		return nil, fmt.Errorf("blockdevice: shard size %d inconsistent with payload %d over %d data shards: %w",
-			shardSize, payloadLen, dataShards, ErrCorrupt)
+	if g.shardSize != (g.payloadLen+g.dataShards-1)/g.dataShards {
+		return g, fmt.Errorf("blockdevice: shard size %d inconsistent with payload %d over %d data shards: %w",
+			g.shardSize, g.payloadLen, g.dataShards, ErrCorrupt)
 	}
-	if uint64(total)*uint64(rsShardHdrSize+shardSize) > 4*uint64(len(body)) {
-		return nil, fmt.Errorf("blockdevice: claimed shard section exceeds 4x body length %d: %w", len(body), ErrCorrupt)
+	if uint64(total)*uint64(rsShardHdrSize+g.shardSize) > 4*uint64(len(body)) {
+		return g, fmt.Errorf("blockdevice: claimed shard section exceeds 4x body length %d: %w", len(body), ErrCorrupt)
 	}
+	return g, nil
+}
 
-	// Parse the shard section; anything missing, truncated, misindexed or
-	// CRC-bad becomes a nil erasure.
-	shards := make([][]byte, total)
+// parseShardSection splits the shard section into total shard slots; anything
+// missing, truncated, misindexed or CRC-bad becomes a nil erasure. It also
+// returns the erasure count.
+func parseShardSection(sect []byte, total, shardSize int) (shards [][]byte, missing int) {
+	shards = make([][]byte, total)
 	stride := rsShardHdrSize + shardSize
-	sect := body[rsMetaSize:]
 	for off := 0; off+stride <= len(sect); off += stride {
 		idx := int(binary.LittleEndian.Uint16(sect[off : off+2]))
 		want := binary.LittleEndian.Uint32(sect[off+2 : off+6])
@@ -285,13 +295,45 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 		}
 		shards[idx] = data
 	}
-
-	missing := 0
 	for _, s := range shards {
 		if s == nil {
 			missing++
 		}
 	}
+	return shards, missing
+}
+
+// readShardSpan copies payload bytes [off, off+len(dst)) out of the intact
+// data shards; it reports false if any covering shard is lost.
+func readShardSpan(shards [][]byte, dataShards, shardSize int, dst []byte, off int) bool {
+	for len(dst) > 0 {
+		si := off / shardSize
+		if si >= dataShards || shards[si] == nil {
+			return false
+		}
+		n := copy(dst, shards[si][off%shardSize:])
+		dst = dst[n:]
+		off += n
+	}
+	return true
+}
+
+// deserializeRS decodes the body of a TierL2 blob (rsMeta + shard section)
+// over base. Called from Deserialize after the outer header verified.
+func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error) {
+	g, err := parseRSMeta(body, blockCount)
+	if err != nil {
+		return nil, err
+	}
+	dataShards, parityShards := g.dataShards, g.parityShards
+	shardSize, payloadLen := g.shardSize, g.payloadLen
+	total := dataShards + parityShards
+
+	if payloadLen == 0 {
+		return applyRecords(nil, TierL1, blockCount, base)
+	}
+
+	shards, missing := parseShardSection(body[rsMetaSize:], total, shardSize)
 
 	if missing <= parityShards {
 		enc, err := reedsolomon.New(dataShards, parityShards)
@@ -324,19 +366,8 @@ func deserializeRS(body []byte, blockCount uint64, base []byte) (*Device, error)
 // rsSalvage applies whatever L1 records survive when Reed-Solomon
 // reconstruction is impossible. shards[i] == nil marks a lost shard.
 func rsSalvage(shards [][]byte, dataShards, shardSize, payloadLen int, base []byte) (*Device, error) {
-	// readSpan copies payload bytes [off, off+len(dst)) out of the intact
-	// data shards; it reports false if any covering shard is lost.
 	readSpan := func(dst []byte, off int) bool {
-		for len(dst) > 0 {
-			si := off / shardSize
-			if si >= dataShards || shards[si] == nil {
-				return false
-			}
-			n := copy(dst, shards[si][off%shardSize:])
-			dst = dst[n:]
-			off += n
-		}
-		return true
+		return readShardSpan(shards, dataShards, shardSize, dst, off)
 	}
 
 	dev := New(base)
